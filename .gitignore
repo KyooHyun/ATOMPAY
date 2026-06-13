@@ -2,6 +2,8 @@ target/
 *.log
 *.iml
 *.txt
+.jdk/
+.maven/
 .idea/
 .vscode/
 .DS_Store

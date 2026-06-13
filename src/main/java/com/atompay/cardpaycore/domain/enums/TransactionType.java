@@ -4,6 +4,6 @@ public enum TransactionType {
     AUTHORIZATION,
     CAPTURE,
     CANCEL,
-    PARTIAL_CANCEL,
+    PARTIAL_REFUND,
     REFUND
 }

@@ -3,9 +3,12 @@ package com.atompay.cardpaycore.controller;
 import com.atompay.cardpaycore.dto.AmountRequest;
 import com.atompay.cardpaycore.dto.AuthorizeRequest;
 import com.atompay.cardpaycore.dto.PaymentResponse;
+import com.atompay.cardpaycore.dto.PaymentTransactionResponse;
 import com.atompay.cardpaycore.service.PaymentService;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
 
 @RestController
 @RequestMapping("/api/v1/payments")
@@ -28,29 +31,45 @@ public class PaymentController {
     @PostMapping("/{authorizationId}/capture")
     public ResponseEntity<PaymentResponse> capture(
             @PathVariable String authorizationId,
-            @RequestBody AmountRequest request
+            @RequestBody AmountRequest request,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey
     ) {
-        return ResponseEntity.ok(paymentService.capture(authorizationId, request.getAmount()));
+        return ResponseEntity.ok(paymentService.capture(authorizationId, request.getAmount(), idempotencyKey));
     }
 
     @PostMapping("/{authorizationId}/cancel")
-    public ResponseEntity<PaymentResponse> cancel(@PathVariable String authorizationId) {
-        return ResponseEntity.ok(paymentService.cancel(authorizationId));
+    public ResponseEntity<PaymentResponse> cancel(
+            @PathVariable String authorizationId,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey
+    ) {
+        return ResponseEntity.ok(paymentService.cancel(authorizationId, idempotencyKey));
     }
 
-    @PostMapping("/{authorizationId}/partial-cancel")
-    public ResponseEntity<PaymentResponse> partialCancel(
+    @PostMapping("/{authorizationId}/partial-refund")
+    public ResponseEntity<PaymentResponse> partialRefund(
             @PathVariable String authorizationId,
-            @RequestBody AmountRequest request
+            @RequestBody AmountRequest request,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey
     ) {
-        return ResponseEntity.ok(paymentService.partialCancel(authorizationId, request.getAmount()));
+        return ResponseEntity.ok(paymentService.partialRefund(authorizationId, request.getAmount(), idempotencyKey));
     }
 
     @PostMapping("/{authorizationId}/refund")
     public ResponseEntity<PaymentResponse> refund(
             @PathVariable String authorizationId,
-            @RequestBody AmountRequest request
+            @RequestBody AmountRequest request,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey
     ) {
-        return ResponseEntity.ok(paymentService.refund(authorizationId, request.getAmount()));
+        return ResponseEntity.ok(paymentService.refund(authorizationId, request.getAmount(), idempotencyKey));
+    }
+
+    @GetMapping("/{authorizationId}/transactions")
+    public ResponseEntity<List<PaymentTransactionResponse>> getTransactions(@PathVariable String authorizationId) {
+        return ResponseEntity.ok(paymentService.listTransactions(authorizationId));
+    }
+
+    @GetMapping("/{authorizationId}")
+    public ResponseEntity<PaymentResponse> getPayment(@PathVariable String authorizationId) {
+        return ResponseEntity.ok(paymentService.getPayment(authorizationId));
     }
 }

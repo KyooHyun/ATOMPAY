@@ -53,4 +53,8 @@ public class IdempotencyKey {
     public String getResponsePayload() {
         return responsePayload;
     }
+
+    public void setResponsePayload(String responsePayload) {
+        this.responsePayload = responsePayload;
+    }
 }

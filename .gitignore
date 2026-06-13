@@ -1,6 +1,7 @@
 target/
 *.log
 *.iml
+*.txt
 .idea/
 .vscode/
 .DS_Store

@@ -3,15 +3,23 @@ package com.atompay.cardpaycore.service;
 import com.atompay.cardpaycore.domain.entity.Authorization;
 import com.atompay.cardpaycore.domain.entity.CardAccount;
 import com.atompay.cardpaycore.domain.entity.IdempotencyKey;
+import com.atompay.cardpaycore.domain.entity.PaymentTransaction;
 import com.atompay.cardpaycore.domain.enums.AuthorizationStatus;
 import com.atompay.cardpaycore.domain.enums.TransactionType;
 import com.atompay.cardpaycore.dto.AuthorizeRequest;
 import com.atompay.cardpaycore.dto.PaymentResponse;
+import com.atompay.cardpaycore.dto.PaymentTransactionResponse;
 import com.atompay.cardpaycore.exception.BadRequestException;
 import com.atompay.cardpaycore.repository.AuthorizationRepository;
 import com.atompay.cardpaycore.repository.CardAccountRepository;
 import com.atompay.cardpaycore.repository.IdempotencyKeyRepository;
+import com.atompay.cardpaycore.repository.PaymentTransactionRepository;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import jakarta.transaction.Transactional;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -19,18 +27,28 @@ import java.nio.charset.StandardCharsets;
 import java.time.OffsetDateTime;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Supplier;
 
 @Service
 public class PaymentService {
 
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper()
+            .registerModule(new JavaTimeModule())
+            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+
     private final CardAccountRepository cardAccountRepository;
     private final AuthorizationRepository authorizationRepository;
     private final IdempotencyKeyRepository idempotencyKeyRepository;
+    private final PaymentTransactionRepository paymentTransactionRepository;
 
-    public PaymentService(CardAccountRepository cardAccountRepository, AuthorizationRepository authorizationRepository, IdempotencyKeyRepository idempotencyKeyRepository) {
+    public PaymentService(CardAccountRepository cardAccountRepository,
+                          AuthorizationRepository authorizationRepository,
+                          IdempotencyKeyRepository idempotencyKeyRepository,
+                          PaymentTransactionRepository paymentTransactionRepository) {
         this.cardAccountRepository = cardAccountRepository;
         this.authorizationRepository = authorizationRepository;
         this.idempotencyKeyRepository = idempotencyKeyRepository;
+        this.paymentTransactionRepository = paymentTransactionRepository;
     }
 
     @Transactional
@@ -39,19 +57,77 @@ public class PaymentService {
             throw new BadRequestException("Idempotency-Key header is required.");
         }
 
-        String requestKeyHash = generateRequestBodyHash(request.getCardId(), request.getAmount());
-        Optional<IdempotencyKey> existingKey = idempotencyKeyRepository.findByKeyValue(idempotencyKey);
-        if (existingKey.isPresent()) {
-            return deserializeResponse(existingKey.get().getResponsePayload());
+        String requestBodyHash = generateRequestBodyHash(request.getCardId(), request.getAmount());
+        return handleIdempotentRequest(
+                idempotencyKey,
+                "/api/v1/payments/authorize",
+                requestBodyHash,
+                () -> createAuthorization(request)
+        );
+    }
+
+    @Transactional
+    public PaymentResponse capture(String authorizationId, BigDecimal amount, String idempotencyKey) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            throw new BadRequestException("Idempotency-Key header is required.");
         }
 
-        if (request.getAmount().compareTo(BigDecimal.ZERO) <= 0) {
-            throw new BadRequestException("Amount must be positive.");
+        String requestBodyHash = generateRequestBodyHash(authorizationId, amount);
+        return handleIdempotentRequest(
+                idempotencyKey,
+                "/api/v1/payments/" + authorizationId + "/capture",
+                requestBodyHash,
+                () -> doCapture(authorizationId, amount)
+        );
+    }
+
+    @Transactional
+    public PaymentResponse cancel(String authorizationId, String idempotencyKey) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            throw new BadRequestException("Idempotency-Key header is required.");
         }
 
-        if (request.getAmount().compareTo(BigDecimal.valueOf(1_000_000)) >= 0) {
-            throw new BadRequestException("Amount exceeds allowed transaction threshold.");
+        String requestBodyHash = generateRequestBodyHash(authorizationId);
+        return handleIdempotentRequest(
+                idempotencyKey,
+                "/api/v1/payments/" + authorizationId + "/cancel",
+                requestBodyHash,
+                () -> doCancel(authorizationId)
+        );
+    }
+
+    @Transactional
+    public PaymentResponse partialRefund(String authorizationId, BigDecimal amount, String idempotencyKey) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            throw new BadRequestException("Idempotency-Key header is required.");
         }
+
+        String requestBodyHash = generateRequestBodyHash(authorizationId, amount);
+        return handleIdempotentRequest(
+                idempotencyKey,
+                "/api/v1/payments/" + authorizationId + "/partial-refund",
+                requestBodyHash,
+                () -> doPartialRefund(authorizationId, amount)
+        );
+    }
+
+    @Transactional
+    public PaymentResponse refund(String authorizationId, BigDecimal amount, String idempotencyKey) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            throw new BadRequestException("Idempotency-Key header is required.");
+        }
+
+        String requestBodyHash = generateRequestBodyHash(authorizationId, amount);
+        return handleIdempotentRequest(
+                idempotencyKey,
+                "/api/v1/payments/" + authorizationId + "/refund",
+                requestBodyHash,
+                () -> doRefund(authorizationId, amount)
+        );
+    }
+
+    private PaymentResponse createAuthorization(AuthorizeRequest request) {
+        validateAuthorizeRequest(request);
 
         CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(request.getCardId())
                 .orElseThrow(() -> new BadRequestException("Card account not found."));
@@ -69,58 +145,33 @@ public class PaymentService {
                 cardAccount.getCardId(),
                 request.getAmount(),
                 AuthorizationStatus.AUTHORIZED,
+                BigDecimal.ZERO,
                 OffsetDateTime.now(),
                 OffsetDateTime.now()
         );
         authorizationRepository.save(authorization);
 
-        PaymentResponse response = new PaymentResponse(
-                authorization.getAuthorizationId(),
-                authorization.getCardId(),
-                authorization.getAmount(),
-                authorization.getStatus().name(),
-                authorization.getCreatedAt(),
-                authorization.getUpdatedAt()
-        );
-
-        idempotencyKeyRepository.save(new IdempotencyKey(
-                idempotencyKey,
-                "/api/v1/payments/authorize",
-                requestKeyHash,
-                serializeResponse(response),
-                OffsetDateTime.now()
-        ));
-
-        return response;
-    }
-
-    public PaymentResponse capture(String authorizationId, BigDecimal amount) {
-        Authorization authorization = authorizationRepository.findByAuthorizationId(authorizationId)
-                .orElseThrow(() -> new BadRequestException("Authorization not found."));
-
-        if (authorization.getStatus() != AuthorizationStatus.AUTHORIZED) {
-            throw new BadRequestException("Only authorized payments can be captured.");
-        }
-
-        if (amount.compareTo(authorization.getAmount()) != 0) {
-            throw new BadRequestException("Capture amount must equal the authorized amount.");
-        }
-
-        authorization.setStatus(AuthorizationStatus.CAPTURED);
-        authorizationRepository.save(authorization);
+        recordTransaction(authorization, TransactionType.AUTHORIZATION, authorization.getAmount());
 
         return mapToResponse(authorization);
     }
 
-    public PaymentResponse cancel(String authorizationId) {
-        Authorization authorization = authorizationRepository.findByAuthorizationId(authorizationId)
+    private PaymentResponse doCapture(String authorizationId, BigDecimal amount) {
+        Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
                 .orElseThrow(() -> new BadRequestException("Authorization not found."));
 
-        if (authorization.getStatus() != AuthorizationStatus.AUTHORIZED && authorization.getStatus() != AuthorizationStatus.CAPTURED) {
-            throw new BadRequestException("Only authorized or captured payments can be cancelled.");
-        }
+        authorization.capture(amount);
+        authorizationRepository.save(authorization);
+        recordTransaction(authorization, TransactionType.CAPTURE, amount);
 
-        authorization.setStatus(AuthorizationStatus.CANCELLED);
+        return mapToResponse(authorization);
+    }
+
+    private PaymentResponse doCancel(String authorizationId) {
+        Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
+                .orElseThrow(() -> new BadRequestException("Authorization not found."));
+
+        authorization.cancel();
         authorizationRepository.save(authorization);
 
         CardAccount cardAccount = cardAccountRepository.findByCardId(authorization.getCardId())
@@ -128,22 +179,15 @@ public class PaymentService {
         cardAccount.increaseAvailableAmount(authorization.getAmount());
         cardAccountRepository.save(cardAccount);
 
+        recordTransaction(authorization, TransactionType.CANCEL, authorization.getAmount());
         return mapToResponse(authorization);
     }
 
-    public PaymentResponse partialCancel(String authorizationId, BigDecimal amount) {
-        Authorization authorization = authorizationRepository.findByAuthorizationId(authorizationId)
+    private PaymentResponse doPartialRefund(String authorizationId, BigDecimal amount) {
+        Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
                 .orElseThrow(() -> new BadRequestException("Authorization not found."));
 
-        if (authorization.getStatus() != AuthorizationStatus.CAPTURED) {
-            throw new BadRequestException("Only captured payments can be partially cancelled.");
-        }
-
-        if (amount.compareTo(BigDecimal.ZERO) <= 0 || amount.compareTo(authorization.getAmount()) >= 0) {
-            throw new BadRequestException("Partial cancel amount must be positive and less than the captured amount.");
-        }
-
-        authorization.setStatus(AuthorizationStatus.PARTIALLY_CANCELLED);
+        authorization.partialRefund(amount);
         authorizationRepository.save(authorization);
 
         CardAccount cardAccount = cardAccountRepository.findByCardId(authorization.getCardId())
@@ -151,24 +195,24 @@ public class PaymentService {
         cardAccount.increaseAvailableAmount(amount);
         cardAccountRepository.save(cardAccount);
 
+        recordTransaction(authorization, TransactionType.PARTIAL_REFUND, amount);
         return mapToResponse(authorization);
     }
 
-    public PaymentResponse refund(String authorizationId, BigDecimal amount) {
-        Authorization authorization = authorizationRepository.findByAuthorizationId(authorizationId)
+    private PaymentResponse doRefund(String authorizationId, BigDecimal amount) {
+        Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
                 .orElseThrow(() -> new BadRequestException("Authorization not found."));
 
-        if (authorization.getStatus() != AuthorizationStatus.CAPTURED && authorization.getStatus() != AuthorizationStatus.PARTIALLY_CANCELLED) {
-            throw new BadRequestException("Only captured or partially cancelled payments can be refunded.");
-        }
-
-        if (amount.compareTo(BigDecimal.ZERO) <= 0 || amount.compareTo(authorization.getAmount()) > 0) {
-            throw new BadRequestException("Refund amount must be positive and not exceed the original captured amount.");
-        }
-
-        authorization.setStatus(AuthorizationStatus.REFUNDED);
+        boolean fullRefund = authorization.getRemainingRefundableAmount().compareTo(amount) == 0;
+        authorization.refund(amount);
         authorizationRepository.save(authorization);
 
+        CardAccount cardAccount = cardAccountRepository.findByCardId(authorization.getCardId())
+                .orElseThrow(() -> new BadRequestException("Card account not found."));
+        cardAccount.increaseAvailableAmount(amount);
+        cardAccountRepository.save(cardAccount);
+
+        recordTransaction(authorization, fullRefund ? TransactionType.REFUND : TransactionType.PARTIAL_REFUND, amount);
         return mapToResponse(authorization);
     }
 
@@ -183,17 +227,133 @@ public class PaymentService {
         );
     }
 
-    private String generateRequestBodyHash(String cardId, BigDecimal amount) {
-        String text = cardId + ":" + amount.toPlainString();
-        return java.util.Base64.getEncoder().encodeToString(text.getBytes(StandardCharsets.UTF_8));
+    private PaymentResponse handleIdempotentRequest(String idempotencyKey,
+                                                     String requestUri,
+                                                     String requestBodyHash,
+                                                     Supplier<PaymentResponse> operation) {
+        Optional<IdempotencyKey> existingKey = idempotencyKeyRepository.findByKeyValue(idempotencyKey);
+        if (existingKey.isPresent()) {
+            IdempotencyKey key = existingKey.get();
+            if (!key.getRequestUri().equals(requestUri) || !key.getRequestBodyHash().equals(requestBodyHash)) {
+                throw new BadRequestException("Idempotency key reuse with different request body is not allowed.");
+            }
+            if (key.getResponsePayload().isBlank()) {
+                throw new BadRequestException("Idempotency key is already being processed. Retry later.");
+            }
+            return deserializeResponse(key.getResponsePayload());
+        }
+
+        IdempotencyKey placeholder = new IdempotencyKey(
+                idempotencyKey,
+                requestUri,
+                requestBodyHash,
+                "",
+                OffsetDateTime.now()
+        );
+        try {
+            placeholder = idempotencyKeyRepository.save(placeholder);
+        } catch (DataIntegrityViolationException ex) {
+            Optional<IdempotencyKey> conflictingKey = idempotencyKeyRepository.findByKeyValue(idempotencyKey);
+            if (conflictingKey.isPresent()) {
+                IdempotencyKey key = conflictingKey.get();
+                if (!key.getRequestUri().equals(requestUri) || !key.getRequestBodyHash().equals(requestBodyHash)) {
+                    throw new BadRequestException("Idempotency key reuse with different request body is not allowed.");
+                }
+                if (key.getResponsePayload().isBlank()) {
+                    throw new BadRequestException("Idempotency key is already being processed. Retry later.");
+                }
+                return deserializeResponse(key.getResponsePayload());
+            }
+            throw ex;
+        }
+
+        PaymentResponse response = operation.get();
+        placeholder.setResponsePayload(serializeResponse(response));
+        idempotencyKeyRepository.save(placeholder);
+        return response;
+    }
+
+    private void validateAuthorizeRequest(AuthorizeRequest request) {
+        if (request == null) {
+            throw new BadRequestException("Request body is required.");
+        }
+
+        if (request.getCardId() == null || request.getCardId().isBlank()) {
+            throw new BadRequestException("Card ID is required.");
+        }
+
+        if (request.getAmount() == null || request.getAmount().compareTo(BigDecimal.ZERO) <= 0) {
+            throw new BadRequestException("Amount must be positive.");
+        }
+
+        if (request.getAmount().compareTo(BigDecimal.valueOf(1_000_000)) >= 0) {
+            throw new BadRequestException("Amount exceeds allowed transaction threshold.");
+        }
+    }
+
+    private String generateRequestBodyHash(Object... values) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < values.length; i++) {
+            if (i > 0) {
+                builder.append(':');
+            }
+            builder.append(values[i] == null ? "" : values[i].toString());
+        }
+        return java.util.Base64.getEncoder().encodeToString(builder.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    private void recordTransaction(Authorization authorization, TransactionType transactionType, BigDecimal amount) {
+        paymentTransactionRepository.save(new com.atompay.cardpaycore.domain.entity.PaymentTransaction(
+                UUID.randomUUID().toString(),
+                authorization.getAuthorizationId(),
+                transactionType,
+                amount,
+                authorization.getStatus().name(),
+                OffsetDateTime.now()
+        ));
+    }
+
+    public java.util.List<PaymentTransactionResponse> listTransactions(String authorizationId) {
+        if (authorizationId == null || authorizationId.isBlank()) {
+            throw new BadRequestException("Authorization ID is required.");
+        }
+        return paymentTransactionRepository.findByAuthorizationId(authorizationId).stream()
+                .map(this::mapToTransactionResponse)
+                .toList();
+    }
+
+    public PaymentResponse getPayment(String authorizationId) {
+        if (authorizationId == null || authorizationId.isBlank()) {
+            throw new BadRequestException("Authorization ID is required.");
+        }
+        Authorization authorization = authorizationRepository.findByAuthorizationId(authorizationId)
+                .orElseThrow(() -> new BadRequestException("Authorization not found."));
+        return mapToResponse(authorization);
+    }
+
+    private PaymentTransactionResponse mapToTransactionResponse(PaymentTransaction transaction) {
+        return new PaymentTransactionResponse(
+                transaction.getTransactionId(),
+                transaction.getTransactionType(),
+                transaction.getAmount(),
+                transaction.getStatus(),
+                transaction.getCreatedAt()
+        );
     }
 
     private String serializeResponse(PaymentResponse response) {
-        return response.getAuthorizationId() + "," + response.getCardId() + "," + response.getAmount() + "," + response.getStatus();
+        try {
+            return OBJECT_MAPPER.writeValueAsString(response);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("Failed to serialize idempotent response", ex);
+        }
     }
 
     private PaymentResponse deserializeResponse(String payload) {
-        String[] parts = payload.split(",");
-        return new PaymentResponse(parts[0], parts[1], new BigDecimal(parts[2]), parts[3], null, null);
+        try {
+            return OBJECT_MAPPER.readValue(payload, PaymentResponse.class);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("Failed to deserialize idempotent response", ex);
+        }
     }
 }

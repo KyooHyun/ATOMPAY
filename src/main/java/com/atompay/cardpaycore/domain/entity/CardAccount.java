@@ -62,10 +62,20 @@ public class CardAccount {
     }
 
     public void deductAvailableAmount(BigDecimal amount) {
-        this.availableAmount = this.availableAmount.subtract(amount);
+        if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new IllegalArgumentException("Amount must be positive.");
+        }
+        BigDecimal updatedAmount = this.availableAmount.subtract(amount);
+        if (updatedAmount.compareTo(BigDecimal.ZERO) < 0) {
+            throw new IllegalArgumentException("Available amount cannot become negative.");
+        }
+        this.availableAmount = updatedAmount;
     }
 
     public void increaseAvailableAmount(BigDecimal amount) {
+        if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new IllegalArgumentException("Amount must be positive.");
+        }
         this.availableAmount = this.availableAmount.add(amount);
     }
 }

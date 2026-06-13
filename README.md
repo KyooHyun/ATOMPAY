@@ -13,7 +13,6 @@ A Spring Boot backend that models a simplified card payment processing core.
 - 승인 → 매입 → 취소/부분환불/환불 상태 전이
 - 룰 기반 차단
   - 한도 초과
-  - 짧은 시간 중복 요청 차단
   - 이상 금액 차단
 - `Spring Boot + Spring Data JPA + MySQL` 설계
 
@@ -53,7 +52,6 @@ A Spring Boot backend that models a simplified card payment processing core.
   - `enum`
 - `dto`
 - `exception`
-- `util`
 
 ## 실행
 ### 개발용 (H2)
@@ -84,7 +82,7 @@ mvn spring-boot:run
 ## 기술적 어필 포인트
 - InfraPulse는 탐지/분석 역량을 보여주는 프로젝트이고, `card-pay-core`는 **카드사 백엔드의 결제 처리 코어 역량**을 보여줍니다.
 - 이 프로젝트는 `동시성 제어`, `Idempotency-Key 기반 멱등성`, `승인-매입-취소-환불 상태 전이`를 중심으로 설계되었습니다.
-- `Spring 첫 프로젝트`였기 때문에 Java를 선택하여 안정성, 가독성, 구현 속도를 확보했습니다.
+- Java에 익숙하기 때문에 `Spring Boot`를 선택하여 안정성, 가독성, 구현 속도를 확보했습니다.
 
 ## 테스트
 - MySQL Testcontainers 기반 동시성 재현 테스트 — 락 제거 시 한도 붕괴를 재현하고, 락 적용으로 해결됨을 최종 금액으로 검증

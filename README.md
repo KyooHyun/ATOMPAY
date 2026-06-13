@@ -1,4 +1,4 @@
-# card-pay-core
+# AtomPay
 
 A Spring Boot backend that models a simplified card payment processing core.
 
@@ -42,6 +42,9 @@ A Spring Boot backend that models a simplified card payment processing core.
 - 승인 시 `PESSIMISTIC_WRITE`로 `CardAccount` 보유 한도를 잠그고, 동시 인증 요청이 충돌하지 않도록 합니다.
 - 환불과 부분 환불도 `Authorization` 행을 `PESSIMISTIC_WRITE`로 잠궈 `refundedAmount` 누적 갱신 경쟁을 방지합니다.
 - 동시성 증명은 H2가 아닌 MySQL(InnoDB) 기반 Testcontainers에서 수행합니다. H2와 MySQL의 `SELECT ... FOR UPDATE` 동작이 다르기 때문에, 이 프로젝트는 MySQL 환경에서 레이스를 재현하고 잠금 적용을 검증합니다.
+
+## 설계하며 고민한 점
+처음엔 락 없이 구현했더니 동시 승인에서 한도가 음수로 깨졌다. 비관적 락(PESSIMISTIC_WRITE)과 낙관적 락을 두고, 한도 차감은 충돌이 잦은 경로라 재시도 비용이 큰 낙관적 락 대신 비관적 락을 택했다. 이후 승인(CardAccount 한도 차감)뿐 아니라 환불(Authorization.refundedAmount 누적)에서도 같은 레이스가 발생함을 확인하고, 양방향 모두 락을 적용하고 테스트로 검증했다. 멱등성도 단순 "키 조회 후 처리"는 조회와 처리 사이 레이스가 남아, DB unique 제약으로 동시 도착을 막는 방식으로 바꿨다.
 
 ## 패키지 구조
 - `controller`

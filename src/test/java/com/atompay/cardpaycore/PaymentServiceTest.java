@@ -53,6 +53,8 @@ class PaymentServiceTest {
         cardAccountRepository.save(new CardAccount("CARD-001", "4111-1111-1111-1111", BigDecimal.valueOf(5_000_000), BigDecimal.valueOf(5_000_000), "ACTIVE"));
     }
 
+    // ── Authorize ──────────────────────────────────────────────────────────────
+
     @Test
     void authorizeShouldCreateAuthorizationAndDeductAvailableAmount() {
         AuthorizeRequest request = new AuthorizeRequest();
@@ -65,6 +67,7 @@ class PaymentServiceTest {
         assertThat(response.getCardId()).isEqualTo("CARD-001");
         assertThat(response.getAmount()).isEqualByComparingTo(BigDecimal.valueOf(100_000));
         assertThat(response.getStatus()).isEqualTo("AUTHORIZED");
+        assertThat(response.getRefundedAmount()).isEqualByComparingTo(BigDecimal.ZERO);
 
         Optional<CardAccount> account = cardAccountRepository.findByCardId("CARD-001");
         assertThat(account).isPresent();
@@ -86,6 +89,35 @@ class PaymentServiceTest {
     }
 
     @Test
+    void authorizeShouldRejectIdempotencyReuseWithDifferentBody() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(100_000));
+        paymentService.authorize(request, "key-123");
+
+        AuthorizeRequest differentRequest = new AuthorizeRequest();
+        differentRequest.setCardId("CARD-001");
+        differentRequest.setAmount(BigDecimal.valueOf(200_000));
+
+        assertThrows(BadRequestException.class,
+                () -> paymentService.authorize(differentRequest, "key-123"));
+    }
+
+    @Test
+    void authorizeShouldRejectInactiveCard() {
+        cardAccountRepository.deleteAll();
+        cardAccountRepository.save(new CardAccount("CARD-002", "4111-1111-1111-2222", BigDecimal.valueOf(5_000_000), BigDecimal.valueOf(5_000_000), "BLOCKED"));
+
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-002");
+        request.setAmount(BigDecimal.valueOf(100_000));
+
+        assertThrows(BadRequestException.class, () -> paymentService.authorize(request, "key-blocked"));
+    }
+
+    // ── Capture ────────────────────────────────────────────────────────────────
+
+    @Test
     void captureShouldTransitionToCapturedAndCreateTransaction() {
         AuthorizeRequest request = new AuthorizeRequest();
         request.setCardId("CARD-001");
@@ -101,60 +133,108 @@ class PaymentServiceTest {
         assertThat(paymentTransactionRepository.count()).isEqualTo(2);
     }
 
+    // ── Cancel ─────────────────────────────────────────────────────────────────
+
+    @Test
+    void cancelShouldTransitionToCancelledAndRestoreAvailableAmount() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(200_000));
+        PaymentResponse authorization = paymentService.authorize(request, "key-auth");
+
+        assertThat(cardAccountRepository.findByCardId("CARD-001").get().getAvailableAmount())
+                .isEqualByComparingTo(BigDecimal.valueOf(4_800_000));
+
+        PaymentResponse cancelResponse = paymentService.cancel(authorization.getAuthorizationId(), "key-cancel");
+
+        assertThat(cancelResponse.getStatus()).isEqualTo("CANCELLED");
+        assertThat(cardAccountRepository.findByCardId("CARD-001").get().getAvailableAmount())
+                .isEqualByComparingTo(BigDecimal.valueOf(5_000_000));
+        assertThat(paymentTransactionRepository.count()).isEqualTo(2);
+    }
+
+    @Test
+    void cancelShouldThrowWhenPaymentAlreadyCaptured() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(100_000));
+        PaymentResponse authorization = paymentService.authorize(request, "key-auth");
+        paymentService.capture(authorization.getAuthorizationId(), BigDecimal.valueOf(100_000), "key-capture");
+
+        assertThrows(IllegalStateException.class,
+                () -> paymentService.cancel(authorization.getAuthorizationId(), "key-cancel"));
+    }
+
+    // ── Refund ─────────────────────────────────────────────────────────────────
+
     @Test
     void refundShouldRestoreAvailableAmountAndRecordRefundTransaction() {
         AuthorizeRequest request = new AuthorizeRequest();
         request.setCardId("CARD-001");
         request.setAmount(BigDecimal.valueOf(100_000));
-
         PaymentResponse authorization = paymentService.authorize(request, "key-123");
-        AmountRequest captureRequest = new AmountRequest();
-        captureRequest.setAmount(BigDecimal.valueOf(100_000));
-        paymentService.capture(authorization.getAuthorizationId(), captureRequest.getAmount(), "key-capture-1");
+        paymentService.capture(authorization.getAuthorizationId(), BigDecimal.valueOf(100_000), "key-capture-1");
 
-        AmountRequest refundRequest = new AmountRequest();
-        refundRequest.setAmount(BigDecimal.valueOf(100_000));
-        PaymentResponse refundResponse = paymentService.refund(authorization.getAuthorizationId(), refundRequest.getAmount(), "key-refund-1");
+        PaymentResponse refundResponse = paymentService.refund(authorization.getAuthorizationId(), BigDecimal.valueOf(100_000), "key-refund-1");
 
         assertThat(refundResponse.getStatus()).isEqualTo("REFUNDED");
-        Optional<CardAccount> account = cardAccountRepository.findByCardId("CARD-001");
-        assertThat(account).isPresent();
-        assertThat(account.get().getAvailableAmount()).isEqualByComparingTo(BigDecimal.valueOf(5_000_000));
+        assertThat(refundResponse.getRefundedAmount()).isEqualByComparingTo(BigDecimal.valueOf(100_000));
+        assertThat(cardAccountRepository.findByCardId("CARD-001").get().getAvailableAmount())
+                .isEqualByComparingTo(BigDecimal.valueOf(5_000_000));
         assertThat(paymentTransactionRepository.count()).isEqualTo(3);
     }
+
+    @Test
+    void refundShouldThrowWhenAmountExceedsRefundable() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(100_000));
+        PaymentResponse authorization = paymentService.authorize(request, "key-auth");
+        paymentService.capture(authorization.getAuthorizationId(), BigDecimal.valueOf(100_000), "key-capture");
+
+        assertThrows(IllegalArgumentException.class,
+                () -> paymentService.refund(authorization.getAuthorizationId(), BigDecimal.valueOf(200_000), "key-over-refund"));
+    }
+
+    // ── Partial Refund ─────────────────────────────────────────────────────────
 
     @Test
     void partialRefundShouldReduceRemainingRefundableAmountAndRecordEvent() {
         AuthorizeRequest request = new AuthorizeRequest();
         request.setCardId("CARD-001");
         request.setAmount(BigDecimal.valueOf(100_000));
-
         PaymentResponse authorization = paymentService.authorize(request, "key-123");
-        AmountRequest captureRequest = new AmountRequest();
-        captureRequest.setAmount(BigDecimal.valueOf(100_000));
-        paymentService.capture(authorization.getAuthorizationId(), captureRequest.getAmount(), "key-capture-1");
+        paymentService.capture(authorization.getAuthorizationId(), BigDecimal.valueOf(100_000), "key-capture-1");
 
-        AmountRequest partialRefundRequest = new AmountRequest();
-        partialRefundRequest.setAmount(BigDecimal.valueOf(40_000));
-        PaymentResponse partialRefundResponse = paymentService.partialRefund(authorization.getAuthorizationId(), partialRefundRequest.getAmount(), "key-partial-refund-1");
+        PaymentResponse partialRefundResponse = paymentService.partialRefund(authorization.getAuthorizationId(), BigDecimal.valueOf(40_000), "key-partial-refund-1");
 
         assertThat(partialRefundResponse.getStatus()).isEqualTo("PARTIALLY_REFUNDED");
-        assertThat(paymentTransactionRepository.count()).isEqualTo(3);
-        assertThat(paymentTransactionRepository.findByAuthorizationId(authorization.getAuthorizationId()))
-                .extracting(paymentTransaction -> paymentTransaction.getTransactionType())
+        assertThat(partialRefundResponse.getRefundedAmount()).isEqualByComparingTo(BigDecimal.valueOf(40_000));
+        assertThat(paymentService.listTransactions(authorization.getAuthorizationId()))
+                .extracting(PaymentTransactionResponse::getTransactionType)
                 .containsExactly(TransactionType.AUTHORIZATION, TransactionType.CAPTURE, TransactionType.PARTIAL_REFUND);
     }
+
+    @Test
+    void partialRefundShouldThrowWhenNotCaptured() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(100_000));
+        PaymentResponse authorization = paymentService.authorize(request, "key-auth");
+
+        assertThrows(IllegalStateException.class,
+                () -> paymentService.partialRefund(authorization.getAuthorizationId(), BigDecimal.valueOf(40_000), "key-partial"));
+    }
+
+    // ── Ledger / Query ─────────────────────────────────────────────────────────
 
     @Test
     void listTransactionsShouldReturnHistoryForAuthorization() {
         AuthorizeRequest request = new AuthorizeRequest();
         request.setCardId("CARD-001");
         request.setAmount(BigDecimal.valueOf(100_000));
-
         PaymentResponse authorization = paymentService.authorize(request, "key-123");
-        AmountRequest captureRequest = new AmountRequest();
-        captureRequest.setAmount(BigDecimal.valueOf(100_000));
-        paymentService.capture(authorization.getAuthorizationId(), captureRequest.getAmount(), "key-capture-1");
+        paymentService.capture(authorization.getAuthorizationId(), BigDecimal.valueOf(100_000), "key-capture-1");
 
         List<PaymentTransactionResponse> transactions = paymentService.listTransactions(authorization.getAuthorizationId());
 
@@ -168,27 +248,11 @@ class PaymentServiceTest {
         AuthorizeRequest request = new AuthorizeRequest();
         request.setCardId("CARD-001");
         request.setAmount(BigDecimal.valueOf(100_000));
-
         PaymentResponse authorization = paymentService.authorize(request, "key-123");
+
         PaymentResponse payment = paymentService.getPayment(authorization.getAuthorizationId());
 
         assertThat(payment.getAuthorizationId()).isEqualTo(authorization.getAuthorizationId());
         assertThat(payment.getStatus()).isEqualTo("AUTHORIZED");
-    }
-
-    @Test
-    void authorizeShouldRejectIdempotencyReuseWithDifferentBody() {
-        AuthorizeRequest request = new AuthorizeRequest();
-        request.setCardId("CARD-001");
-        request.setAmount(BigDecimal.valueOf(100_000));
-
-        paymentService.authorize(request, "key-123");
-
-        AuthorizeRequest differentRequest = new AuthorizeRequest();
-        differentRequest.setCardId("CARD-001");
-        differentRequest.setAmount(BigDecimal.valueOf(200_000));
-
-        org.junit.jupiter.api.Assertions.assertThrows(BadRequestException.class,
-                () -> paymentService.authorize(differentRequest, "key-123"));
     }
 }

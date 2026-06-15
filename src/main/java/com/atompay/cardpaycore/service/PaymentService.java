@@ -18,8 +18,8 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import jakarta.transaction.Transactional;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -127,10 +127,12 @@ public class PaymentService {
     }
 
     private PaymentResponse createAuthorization(AuthorizeRequest request) {
-        validateAuthorizeRequest(request);
-
         CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(request.getCardId())
                 .orElseThrow(() -> new BadRequestException("Card account not found."));
+
+        if (!"ACTIVE".equals(cardAccount.getStatus())) {
+            throw new BadRequestException("Card account is not active.");
+        }
 
         if (cardAccount.getAvailableAmount().compareTo(request.getAmount()) < 0) {
             throw new BadRequestException("Available credit limit is insufficient.");
@@ -174,7 +176,7 @@ public class PaymentService {
         authorization.cancel();
         authorizationRepository.save(authorization);
 
-        CardAccount cardAccount = cardAccountRepository.findByCardId(authorization.getCardId())
+        CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
                 .orElseThrow(() -> new BadRequestException("Card account not found."));
         cardAccount.increaseAvailableAmount(authorization.getAmount());
         cardAccountRepository.save(cardAccount);
@@ -190,7 +192,7 @@ public class PaymentService {
         authorization.partialRefund(amount);
         authorizationRepository.save(authorization);
 
-        CardAccount cardAccount = cardAccountRepository.findByCardId(authorization.getCardId())
+        CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
                 .orElseThrow(() -> new BadRequestException("Card account not found."));
         cardAccount.increaseAvailableAmount(amount);
         cardAccountRepository.save(cardAccount);
@@ -207,7 +209,7 @@ public class PaymentService {
         authorization.refund(amount);
         authorizationRepository.save(authorization);
 
-        CardAccount cardAccount = cardAccountRepository.findByCardId(authorization.getCardId())
+        CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
                 .orElseThrow(() -> new BadRequestException("Card account not found."));
         cardAccount.increaseAvailableAmount(amount);
         cardAccountRepository.save(cardAccount);
@@ -222,6 +224,7 @@ public class PaymentService {
                 authorization.getCardId(),
                 authorization.getAmount(),
                 authorization.getStatus().name(),
+                authorization.getRefundedAmount(),
                 authorization.getCreatedAt(),
                 authorization.getUpdatedAt()
         );
@@ -271,24 +274,6 @@ public class PaymentService {
         placeholder.setResponsePayload(serializeResponse(response));
         idempotencyKeyRepository.save(placeholder);
         return response;
-    }
-
-    private void validateAuthorizeRequest(AuthorizeRequest request) {
-        if (request == null) {
-            throw new BadRequestException("Request body is required.");
-        }
-
-        if (request.getCardId() == null || request.getCardId().isBlank()) {
-            throw new BadRequestException("Card ID is required.");
-        }
-
-        if (request.getAmount() == null || request.getAmount().compareTo(BigDecimal.ZERO) <= 0) {
-            throw new BadRequestException("Amount must be positive.");
-        }
-
-        if (request.getAmount().compareTo(BigDecimal.valueOf(1_000_000)) >= 0) {
-            throw new BadRequestException("Amount exceeds allowed transaction threshold.");
-        }
     }
 
     private String generateRequestBodyHash(Object... values) {

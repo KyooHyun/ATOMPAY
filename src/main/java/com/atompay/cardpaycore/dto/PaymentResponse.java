@@ -8,17 +8,20 @@ public class PaymentResponse {
     private String cardId;
     private BigDecimal amount;
     private String status;
+    private BigDecimal refundedAmount;
     private OffsetDateTime createdAt;
     private OffsetDateTime updatedAt;
 
     public PaymentResponse() {
     }
 
-    public PaymentResponse(String authorizationId, String cardId, BigDecimal amount, String status, OffsetDateTime createdAt, OffsetDateTime updatedAt) {
+    public PaymentResponse(String authorizationId, String cardId, BigDecimal amount, String status,
+                           BigDecimal refundedAmount, OffsetDateTime createdAt, OffsetDateTime updatedAt) {
         this.authorizationId = authorizationId;
         this.cardId = cardId;
         this.amount = amount;
         this.status = status;
+        this.refundedAmount = refundedAmount;
         this.createdAt = createdAt;
         this.updatedAt = updatedAt;
     }
@@ -53,6 +56,14 @@ public class PaymentResponse {
 
     public void setStatus(String status) {
         this.status = status;
+    }
+
+    public BigDecimal getRefundedAmount() {
+        return refundedAmount;
+    }
+
+    public void setRefundedAmount(BigDecimal refundedAmount) {
+        this.refundedAmount = refundedAmount;
     }
 
     public OffsetDateTime getCreatedAt() {

@@ -166,4 +166,60 @@ class PaymentServiceMySqlConcurrencyTest {
                 .orElseThrow();
         assertThat(finalAvailableAmount).isEqualByComparingTo(BigDecimal.valueOf(2_000_000));
     }
+
+    @Test
+    void mySqlShouldPreserveAllRestoresOnConcurrentCancels() throws InterruptedException {
+        // 같은 카드의 서로 다른 두 승인을 동시에 취소할 때
+        // CardAccount.availableAmount 복원이 둘 다 반영되어야 한다.
+        // 락 없이 findByCardId를 쓰면 두 스레드가 같은 잔액을 읽고 각자 덮어써
+        // 한 쪽 복원이 유실된다.
+        AuthorizeRequest req1 = new AuthorizeRequest();
+        req1.setCardId("CARD-001");
+        req1.setAmount(BigDecimal.valueOf(100_000));
+
+        AuthorizeRequest req2 = new AuthorizeRequest();
+        req2.setCardId("CARD-001");
+        req2.setAmount(BigDecimal.valueOf(200_000));
+
+        PaymentResponse auth1 = paymentService.authorize(req1, "key-auth-1");
+        PaymentResponse auth2 = paymentService.authorize(req2, "key-auth-2");
+
+        // 두 승인 후 잔액 확인
+        BigDecimal afterAuthorize = cardAccountRepository.findByCardId("CARD-001")
+                .map(CardAccount::getAvailableAmount).orElseThrow();
+        assertThat(afterAuthorize).isEqualByComparingTo(BigDecimal.valueOf(4_700_000));
+
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch endLatch = new CountDownLatch(2);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+
+        executor.submit(() -> {
+            try {
+                startLatch.await();
+                paymentService.cancel(auth1.getAuthorizationId(), "key-cancel-1");
+            } catch (Exception ignored) {
+            } finally {
+                endLatch.countDown();
+            }
+        });
+        executor.submit(() -> {
+            try {
+                startLatch.await();
+                paymentService.cancel(auth2.getAuthorizationId(), "key-cancel-2");
+            } catch (Exception ignored) {
+            } finally {
+                endLatch.countDown();
+            }
+        });
+
+        startLatch.countDown();
+        endLatch.await(15, TimeUnit.SECONDS);
+        executor.shutdownNow();
+
+        // 두 취소가 모두 성공하면 잔액이 원상복구되어야 한다.
+        // 락이 없었다면 한 쪽 복원이 유실되어 4,800,000 또는 4,900,000이 된다.
+        BigDecimal finalAmount = cardAccountRepository.findByCardId("CARD-001")
+                .map(CardAccount::getAvailableAmount).orElseThrow();
+        assertThat(finalAmount).isEqualByComparingTo(BigDecimal.valueOf(5_000_000));
+    }
 }

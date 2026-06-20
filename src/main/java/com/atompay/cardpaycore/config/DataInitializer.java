@@ -1,6 +1,7 @@
 package com.atompay.cardpaycore.config;
 
 import com.atompay.cardpaycore.domain.entity.CardAccount;
+import com.atompay.cardpaycore.domain.enums.CardAccountStatus;
 import com.atompay.cardpaycore.repository.CardAccountRepository;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.context.annotation.Bean;
@@ -20,7 +21,7 @@ public class DataInitializer {
                         "4111-1111-1111-1111",
                         BigDecimal.valueOf(5_000_000),
                         BigDecimal.valueOf(5_000_000),
-                        "ACTIVE"
+                        CardAccountStatus.ACTIVE
                 );
                 cardAccountRepository.save(cardAccount);
             }

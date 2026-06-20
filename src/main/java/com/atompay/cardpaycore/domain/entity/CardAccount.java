@@ -1,5 +1,6 @@
 package com.atompay.cardpaycore.domain.entity;
 
+import com.atompay.cardpaycore.domain.enums.CardAccountStatus;
 import jakarta.persistence.*;
 import java.math.BigDecimal;
 
@@ -24,12 +25,13 @@ public class CardAccount {
     private BigDecimal availableAmount;
 
     @Column(nullable = false)
-    private String status;
+    @Enumerated(EnumType.STRING)
+    private CardAccountStatus status;
 
     protected CardAccount() {
     }
 
-    public CardAccount(String cardId, String cardNumber, BigDecimal creditLimit, BigDecimal availableAmount, String status) {
+    public CardAccount(String cardId, String cardNumber, BigDecimal creditLimit, BigDecimal availableAmount, CardAccountStatus status) {
         this.cardId = cardId;
         this.cardNumber = cardNumber;
         this.creditLimit = creditLimit;
@@ -57,7 +59,7 @@ public class CardAccount {
         return availableAmount;
     }
 
-    public String getStatus() {
+    public CardAccountStatus getStatus() {
         return status;
     }
 

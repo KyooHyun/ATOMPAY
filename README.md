@@ -17,7 +17,7 @@
 | 핵심 주제 | 동시성 제어 · 멱등성 · 결제 상태 머신 |
 | API 문서 | Swagger UI — `http://localhost:8080/swagger-ui.html` |
 | 검증 | JUnit 단위 테스트 13개 + MySQL Testcontainers 동시성 테스트 |
-| 운영 가시성 | MDC 기반 X-Request-Id 추적 · Spring Actuator `/actuator/health` |
+| 운영 가시성 | MDC 기반 X-Request-Id 추적 · SLF4J 구조적 로깅 · Spring Actuator `/actuator/health` |
 | 의도적으로 제외 | 프론트엔드, PG 연동, 정산/대사, 인증/회원 |
 
 ---
@@ -143,7 +143,7 @@ service      # 트랜잭션 경계, 락 획득, 멱등성 처리 조율
 repository   # JPA, 비관적 락 조회(findByAuthorizationIdForUpdate 등)
 domain
  ├─ entity   # 상태 전이 메서드(capture/cancel/refund)와 불변식을 보유
- └─ enum     # 결제 상태 정의
+ └─ enum     # 결제 상태 / 카드 상태 정의
 dto
 exception    # GlobalExceptionHandler 기반 일관된 예외 응답
 ```

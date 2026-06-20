@@ -29,8 +29,8 @@ public class PaymentController {
     @Operation(summary = "Authorize a payment", description = "Reserves funds on the card account. Returns AUTHORIZED status.")
     public ResponseEntity<PaymentResponse> authorize(
             @Valid @RequestBody AuthorizeRequest request,
-            @Parameter(description = "Client-generated unique key for idempotent retries")
-            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey
+            @Parameter(description = "Client-generated unique key for idempotent retries", required = true)
+            @RequestHeader(value = "Idempotency-Key") String idempotencyKey
     ) {
         return ResponseEntity.ok(paymentService.authorize(request, idempotencyKey));
     }
@@ -40,8 +40,8 @@ public class PaymentController {
     public ResponseEntity<PaymentResponse> capture(
             @PathVariable String authorizationId,
             @Valid @RequestBody AmountRequest request,
-            @Parameter(description = "Client-generated unique key for idempotent retries")
-            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey
+            @Parameter(description = "Client-generated unique key for idempotent retries", required = true)
+            @RequestHeader(value = "Idempotency-Key") String idempotencyKey
     ) {
         return ResponseEntity.ok(paymentService.capture(authorizationId, request.getAmount(), idempotencyKey));
     }
@@ -50,8 +50,8 @@ public class PaymentController {
     @Operation(summary = "Cancel an authorized payment", description = "Voids the authorization before capture. Restores available credit.")
     public ResponseEntity<PaymentResponse> cancel(
             @PathVariable String authorizationId,
-            @Parameter(description = "Client-generated unique key for idempotent retries")
-            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey
+            @Parameter(description = "Client-generated unique key for idempotent retries", required = true)
+            @RequestHeader(value = "Idempotency-Key") String idempotencyKey
     ) {
         return ResponseEntity.ok(paymentService.cancel(authorizationId, idempotencyKey));
     }
@@ -61,8 +61,8 @@ public class PaymentController {
     public ResponseEntity<PaymentResponse> partialRefund(
             @PathVariable String authorizationId,
             @Valid @RequestBody AmountRequest request,
-            @Parameter(description = "Client-generated unique key for idempotent retries")
-            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey
+            @Parameter(description = "Client-generated unique key for idempotent retries", required = true)
+            @RequestHeader(value = "Idempotency-Key") String idempotencyKey
     ) {
         return ResponseEntity.ok(paymentService.partialRefund(authorizationId, request.getAmount(), idempotencyKey));
     }
@@ -72,8 +72,8 @@ public class PaymentController {
     public ResponseEntity<PaymentResponse> refund(
             @PathVariable String authorizationId,
             @Valid @RequestBody AmountRequest request,
-            @Parameter(description = "Client-generated unique key for idempotent retries")
-            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey
+            @Parameter(description = "Client-generated unique key for idempotent retries", required = true)
+            @RequestHeader(value = "Idempotency-Key") String idempotencyKey
     ) {
         return ResponseEntity.ok(paymentService.refund(authorizationId, request.getAmount(), idempotencyKey));
     }

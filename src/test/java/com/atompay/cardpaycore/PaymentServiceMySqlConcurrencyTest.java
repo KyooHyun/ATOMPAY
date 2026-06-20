@@ -1,6 +1,7 @@
 package com.atompay.cardpaycore;
 
 import com.atompay.cardpaycore.domain.entity.CardAccount;
+import com.atompay.cardpaycore.domain.enums.CardAccountStatus;
 import com.atompay.cardpaycore.domain.enums.TransactionType;
 import com.atompay.cardpaycore.dto.AmountRequest;
 import com.atompay.cardpaycore.dto.AuthorizeRequest;
@@ -76,7 +77,7 @@ class PaymentServiceMySqlConcurrencyTest {
         idempotencyKeyRepository.deleteAll();
         authorizationRepository.deleteAll();
         cardAccountRepository.deleteAll();
-        cardAccountRepository.save(new CardAccount("CARD-001", "4111-1111-1111-1111", BigDecimal.valueOf(5_000_000), BigDecimal.valueOf(5_000_000), "ACTIVE"));
+        cardAccountRepository.save(new CardAccount("CARD-001", "4111-1111-1111-1111", BigDecimal.valueOf(5_000_000), BigDecimal.valueOf(5_000_000), CardAccountStatus.ACTIVE));
     }
 
     @Test

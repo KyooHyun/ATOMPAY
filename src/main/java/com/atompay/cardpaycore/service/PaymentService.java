@@ -5,6 +5,7 @@ import com.atompay.cardpaycore.domain.entity.CardAccount;
 import com.atompay.cardpaycore.domain.entity.IdempotencyKey;
 import com.atompay.cardpaycore.domain.entity.PaymentTransaction;
 import com.atompay.cardpaycore.domain.enums.AuthorizationStatus;
+import com.atompay.cardpaycore.domain.enums.CardAccountStatus;
 import com.atompay.cardpaycore.domain.enums.TransactionType;
 import com.atompay.cardpaycore.dto.AuthorizeRequest;
 import com.atompay.cardpaycore.dto.PaymentResponse;
@@ -18,19 +19,27 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.OffsetDateTime;
+import java.util.Base64;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Supplier;
 
 @Service
 public class PaymentService {
+
+    private static final Logger log = LoggerFactory.getLogger(PaymentService.class);
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper()
             .registerModule(new JavaTimeModule())
@@ -130,7 +139,7 @@ public class PaymentService {
         CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(request.getCardId())
                 .orElseThrow(() -> new BadRequestException("Card account not found."));
 
-        if (!"ACTIVE".equals(cardAccount.getStatus())) {
+        if (cardAccount.getStatus() != CardAccountStatus.ACTIVE) {
             throw new BadRequestException("Card account is not active.");
         }
 
@@ -152,8 +161,10 @@ public class PaymentService {
                 OffsetDateTime.now()
         );
         authorizationRepository.save(authorization);
-
         recordTransaction(authorization, TransactionType.AUTHORIZATION, authorization.getAmount());
+
+        log.info("Authorization created: authorizationId={}, cardId={}, amount={}",
+                authorizationId, cardAccount.getCardId(), request.getAmount());
 
         return mapToResponse(authorization);
     }
@@ -165,6 +176,8 @@ public class PaymentService {
         authorization.capture(amount);
         authorizationRepository.save(authorization);
         recordTransaction(authorization, TransactionType.CAPTURE, amount);
+
+        log.info("Payment captured: authorizationId={}, amount={}", authorizationId, amount);
 
         return mapToResponse(authorization);
     }
@@ -180,8 +193,10 @@ public class PaymentService {
                 .orElseThrow(() -> new BadRequestException("Card account not found."));
         cardAccount.increaseAvailableAmount(authorization.getAmount());
         cardAccountRepository.save(cardAccount);
-
         recordTransaction(authorization, TransactionType.CANCEL, authorization.getAmount());
+
+        log.info("Authorization cancelled: authorizationId={}, restoredAmount={}", authorizationId, authorization.getAmount());
+
         return mapToResponse(authorization);
     }
 
@@ -196,8 +211,11 @@ public class PaymentService {
                 .orElseThrow(() -> new BadRequestException("Card account not found."));
         cardAccount.increaseAvailableAmount(amount);
         cardAccountRepository.save(cardAccount);
-
         recordTransaction(authorization, TransactionType.PARTIAL_REFUND, amount);
+
+        log.info("Partial refund processed: authorizationId={}, amount={}, totalRefunded={}",
+                authorizationId, amount, authorization.getRefundedAmount());
+
         return mapToResponse(authorization);
     }
 
@@ -213,8 +231,10 @@ public class PaymentService {
                 .orElseThrow(() -> new BadRequestException("Card account not found."));
         cardAccount.increaseAvailableAmount(amount);
         cardAccountRepository.save(cardAccount);
-
         recordTransaction(authorization, fullRefund ? TransactionType.REFUND : TransactionType.PARTIAL_REFUND, amount);
+
+        log.info("Refund processed: authorizationId={}, amount={}, full={}", authorizationId, amount, fullRefund);
+
         return mapToResponse(authorization);
     }
 
@@ -243,6 +263,7 @@ public class PaymentService {
             if (key.getResponsePayload().isBlank()) {
                 throw new BadRequestException("Idempotency key is already being processed. Retry later.");
             }
+            log.debug("Returning cached idempotent response for key={}", idempotencyKey);
             return deserializeResponse(key.getResponsePayload());
         }
 
@@ -277,18 +298,20 @@ public class PaymentService {
     }
 
     private String generateRequestBodyHash(Object... values) {
-        StringBuilder builder = new StringBuilder();
-        for (int i = 0; i < values.length; i++) {
-            if (i > 0) {
-                builder.append(':');
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            for (Object value : values) {
+                digest.update((value == null ? "" : value.toString()).getBytes(StandardCharsets.UTF_8));
+                digest.update((byte) 0); // NUL-byte separator prevents cross-field collisions
             }
-            builder.append(values[i] == null ? "" : values[i].toString());
+            return Base64.getEncoder().encodeToString(digest.digest());
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 not available", e);
         }
-        return java.util.Base64.getEncoder().encodeToString(builder.toString().getBytes(StandardCharsets.UTF_8));
     }
 
     private void recordTransaction(Authorization authorization, TransactionType transactionType, BigDecimal amount) {
-        paymentTransactionRepository.save(new com.atompay.cardpaycore.domain.entity.PaymentTransaction(
+        paymentTransactionRepository.save(new PaymentTransaction(
                 UUID.randomUUID().toString(),
                 authorization.getAuthorizationId(),
                 transactionType,
@@ -298,7 +321,7 @@ public class PaymentService {
         ));
     }
 
-    public java.util.List<PaymentTransactionResponse> listTransactions(String authorizationId) {
+    public List<PaymentTransactionResponse> listTransactions(String authorizationId) {
         if (authorizationId == null || authorizationId.isBlank()) {
             throw new BadRequestException("Authorization ID is required.");
         }

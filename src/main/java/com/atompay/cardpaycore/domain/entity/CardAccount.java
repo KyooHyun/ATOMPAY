@@ -78,6 +78,10 @@ public class CardAccount {
         if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) {
             throw new IllegalArgumentException("Amount must be positive.");
         }
-        this.availableAmount = this.availableAmount.add(amount);
+        BigDecimal updated = this.availableAmount.add(amount);
+        if (updated.compareTo(this.creditLimit) > 0) {
+            throw new IllegalStateException("Restored amount would exceed credit limit — possible duplicate restore.");
+        }
+        this.availableAmount = updated;
     }
 }

@@ -10,21 +10,22 @@ import com.atompay.cardpaycore.repository.AuthorizationRepository;
 import com.atompay.cardpaycore.repository.CardAccountRepository;
 import com.atompay.cardpaycore.repository.IdempotencyKeyRepository;
 import com.atompay.cardpaycore.repository.PaymentTransactionRepository;
+import com.atompay.cardpaycore.config.JacksonConfig;
+import com.atompay.cardpaycore.service.IdempotencyService;
 import com.atompay.cardpaycore.service.PaymentService;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.transaction.BeforeTransaction;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.math.BigDecimal;
-import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -37,7 +38,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @Testcontainers
 @DataJpaTest
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
-@Import(PaymentService.class)
+@Import({PaymentService.class, IdempotencyService.class, JacksonConfig.class})
 class PaymentServiceMySqlConcurrencyTest {
 
     @Container
@@ -71,12 +72,12 @@ class PaymentServiceMySqlConcurrencyTest {
     @Autowired
     private PaymentService paymentService;
 
-    @BeforeEach
+    @BeforeTransaction
     void setUp() {
-        paymentTransactionRepository.deleteAll();
-        idempotencyKeyRepository.deleteAll();
-        authorizationRepository.deleteAll();
-        cardAccountRepository.deleteAll();
+        paymentTransactionRepository.deleteAllInBatch();
+        idempotencyKeyRepository.deleteAllInBatch();
+        authorizationRepository.deleteAllInBatch();
+        cardAccountRepository.deleteAllInBatch();
         cardAccountRepository.save(new CardAccount("CARD-001", "4111-1111-1111-1111", BigDecimal.valueOf(5_000_000), BigDecimal.valueOf(5_000_000), CardAccountStatus.ACTIVE));
     }
 
@@ -119,7 +120,7 @@ class PaymentServiceMySqlConcurrencyTest {
         assertThat(outcomes).anyMatch(result -> result.startsWith("success-"));
         assertThat(outcomes).anyMatch(result -> result.startsWith("fail-"));
 
-        assertThat(paymentTransactionRepository.findByAuthorizationId(authorization.getAuthorizationId()))
+        assertThat(paymentTransactionRepository.findByAuthorizationIdOrderByCreatedAtAsc(authorization.getAuthorizationId()))
                 .extracting(transaction -> transaction.getTransactionType())
                 .contains(TransactionType.AUTHORIZATION, TransactionType.CAPTURE, TransactionType.PARTIAL_REFUND);
 

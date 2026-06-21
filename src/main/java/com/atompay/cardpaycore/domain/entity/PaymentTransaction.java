@@ -1,5 +1,6 @@
 package com.atompay.cardpaycore.domain.entity;
 
+import com.atompay.cardpaycore.domain.enums.AuthorizationStatus;
 import com.atompay.cardpaycore.domain.enums.TransactionType;
 import jakarta.persistence.*;
 import java.math.BigDecimal;
@@ -27,7 +28,8 @@ public class PaymentTransaction {
     private BigDecimal amount;
 
     @Column(nullable = false)
-    private String status;
+    @Enumerated(EnumType.STRING)
+    private AuthorizationStatus status;
 
     @Column(nullable = false)
     private OffsetDateTime createdAt;
@@ -35,7 +37,7 @@ public class PaymentTransaction {
     protected PaymentTransaction() {
     }
 
-    public PaymentTransaction(String transactionId, String authorizationId, TransactionType transactionType, BigDecimal amount, String status, OffsetDateTime createdAt) {
+    public PaymentTransaction(String transactionId, String authorizationId, TransactionType transactionType, BigDecimal amount, AuthorizationStatus status, OffsetDateTime createdAt) {
         this.transactionId = transactionId;
         this.authorizationId = authorizationId;
         this.transactionType = transactionType;
@@ -64,7 +66,7 @@ public class PaymentTransaction {
         return amount;
     }
 
-    public String getStatus() {
+    public AuthorizationStatus getStatus() {
         return status;
     }
 

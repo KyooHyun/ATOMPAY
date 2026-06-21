@@ -1,5 +1,6 @@
 package com.atompay.cardpaycore.dto;
 
+import com.atompay.cardpaycore.domain.enums.AuthorizationStatus;
 import com.atompay.cardpaycore.domain.enums.TransactionType;
 
 import java.math.BigDecimal;
@@ -9,7 +10,7 @@ public class PaymentTransactionResponse {
     private String transactionId;
     private TransactionType transactionType;
     private BigDecimal amount;
-    private String status;
+    private AuthorizationStatus status;
     private OffsetDateTime createdAt;
 
     public PaymentTransactionResponse() {
@@ -18,7 +19,7 @@ public class PaymentTransactionResponse {
     public PaymentTransactionResponse(String transactionId,
                                       TransactionType transactionType,
                                       BigDecimal amount,
-                                      String status,
+                                      AuthorizationStatus status,
                                       OffsetDateTime createdAt) {
         this.transactionId = transactionId;
         this.transactionType = transactionType;
@@ -51,11 +52,11 @@ public class PaymentTransactionResponse {
         this.amount = amount;
     }
 
-    public String getStatus() {
+    public AuthorizationStatus getStatus() {
         return status;
     }
 
-    public void setStatus(String status) {
+    public void setStatus(AuthorizationStatus status) {
         this.status = status;
     }
 

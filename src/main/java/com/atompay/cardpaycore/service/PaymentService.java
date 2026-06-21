@@ -11,17 +11,15 @@ import com.atompay.cardpaycore.dto.AuthorizeRequest;
 import com.atompay.cardpaycore.dto.PaymentResponse;
 import com.atompay.cardpaycore.dto.PaymentTransactionResponse;
 import com.atompay.cardpaycore.exception.BadRequestException;
+import com.atompay.cardpaycore.exception.NotFoundException;
 import com.atompay.cardpaycore.repository.AuthorizationRepository;
 import com.atompay.cardpaycore.repository.CardAccountRepository;
 import com.atompay.cardpaycore.repository.IdempotencyKeyRepository;
 import com.atompay.cardpaycore.repository.PaymentTransactionRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.stereotype.Service;
 
@@ -41,31 +39,29 @@ public class PaymentService {
 
     private static final Logger log = LoggerFactory.getLogger(PaymentService.class);
 
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper()
-            .registerModule(new JavaTimeModule())
-            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
-
+    private final ObjectMapper objectMapper;
     private final CardAccountRepository cardAccountRepository;
     private final AuthorizationRepository authorizationRepository;
     private final IdempotencyKeyRepository idempotencyKeyRepository;
     private final PaymentTransactionRepository paymentTransactionRepository;
+    private final IdempotencyService idempotencyService;
 
-    public PaymentService(CardAccountRepository cardAccountRepository,
+    public PaymentService(ObjectMapper objectMapper,
+                          CardAccountRepository cardAccountRepository,
                           AuthorizationRepository authorizationRepository,
                           IdempotencyKeyRepository idempotencyKeyRepository,
-                          PaymentTransactionRepository paymentTransactionRepository) {
+                          PaymentTransactionRepository paymentTransactionRepository,
+                          IdempotencyService idempotencyService) {
+        this.objectMapper = objectMapper;
         this.cardAccountRepository = cardAccountRepository;
         this.authorizationRepository = authorizationRepository;
         this.idempotencyKeyRepository = idempotencyKeyRepository;
         this.paymentTransactionRepository = paymentTransactionRepository;
+        this.idempotencyService = idempotencyService;
     }
 
     @Transactional
     public PaymentResponse authorize(AuthorizeRequest request, String idempotencyKey) {
-        if (idempotencyKey == null || idempotencyKey.isBlank()) {
-            throw new BadRequestException("Idempotency-Key header is required.");
-        }
-
         String requestBodyHash = generateRequestBodyHash(request.getCardId(), request.getAmount());
         return handleIdempotentRequest(
                 idempotencyKey,
@@ -77,10 +73,6 @@ public class PaymentService {
 
     @Transactional
     public PaymentResponse capture(String authorizationId, BigDecimal amount, String idempotencyKey) {
-        if (idempotencyKey == null || idempotencyKey.isBlank()) {
-            throw new BadRequestException("Idempotency-Key header is required.");
-        }
-
         String requestBodyHash = generateRequestBodyHash(authorizationId, amount);
         return handleIdempotentRequest(
                 idempotencyKey,
@@ -92,10 +84,6 @@ public class PaymentService {
 
     @Transactional
     public PaymentResponse cancel(String authorizationId, String idempotencyKey) {
-        if (idempotencyKey == null || idempotencyKey.isBlank()) {
-            throw new BadRequestException("Idempotency-Key header is required.");
-        }
-
         String requestBodyHash = generateRequestBodyHash(authorizationId);
         return handleIdempotentRequest(
                 idempotencyKey,
@@ -107,10 +95,6 @@ public class PaymentService {
 
     @Transactional
     public PaymentResponse partialRefund(String authorizationId, BigDecimal amount, String idempotencyKey) {
-        if (idempotencyKey == null || idempotencyKey.isBlank()) {
-            throw new BadRequestException("Idempotency-Key header is required.");
-        }
-
         String requestBodyHash = generateRequestBodyHash(authorizationId, amount);
         return handleIdempotentRequest(
                 idempotencyKey,
@@ -122,10 +106,6 @@ public class PaymentService {
 
     @Transactional
     public PaymentResponse refund(String authorizationId, BigDecimal amount, String idempotencyKey) {
-        if (idempotencyKey == null || idempotencyKey.isBlank()) {
-            throw new BadRequestException("Idempotency-Key header is required.");
-        }
-
         String requestBodyHash = generateRequestBodyHash(authorizationId, amount);
         return handleIdempotentRequest(
                 idempotencyKey,
@@ -137,7 +117,7 @@ public class PaymentService {
 
     private PaymentResponse createAuthorization(AuthorizeRequest request) {
         CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(request.getCardId())
-                .orElseThrow(() -> new BadRequestException("Card account not found."));
+                .orElseThrow(() -> new NotFoundException("Card account not found: " + request.getCardId()));
 
         if (cardAccount.getStatus() != CardAccountStatus.ACTIVE) {
             throw new BadRequestException("Card account is not active.");
@@ -171,7 +151,7 @@ public class PaymentService {
 
     private PaymentResponse doCapture(String authorizationId, BigDecimal amount) {
         Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
-                .orElseThrow(() -> new BadRequestException("Authorization not found."));
+                .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
 
         authorization.capture(amount);
         authorizationRepository.save(authorization);
@@ -184,13 +164,13 @@ public class PaymentService {
 
     private PaymentResponse doCancel(String authorizationId) {
         Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
-                .orElseThrow(() -> new BadRequestException("Authorization not found."));
+                .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
 
         authorization.cancel();
         authorizationRepository.save(authorization);
 
         CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
-                .orElseThrow(() -> new BadRequestException("Card account not found."));
+                .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
         cardAccount.increaseAvailableAmount(authorization.getAmount());
         cardAccountRepository.save(cardAccount);
         recordTransaction(authorization, TransactionType.CANCEL, authorization.getAmount());
@@ -202,13 +182,13 @@ public class PaymentService {
 
     private PaymentResponse doPartialRefund(String authorizationId, BigDecimal amount) {
         Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
-                .orElseThrow(() -> new BadRequestException("Authorization not found."));
+                .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
 
         authorization.partialRefund(amount);
         authorizationRepository.save(authorization);
 
         CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
-                .orElseThrow(() -> new BadRequestException("Card account not found."));
+                .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
         cardAccount.increaseAvailableAmount(amount);
         cardAccountRepository.save(cardAccount);
         recordTransaction(authorization, TransactionType.PARTIAL_REFUND, amount);
@@ -221,14 +201,14 @@ public class PaymentService {
 
     private PaymentResponse doRefund(String authorizationId, BigDecimal amount) {
         Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
-                .orElseThrow(() -> new BadRequestException("Authorization not found."));
+                .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
 
         boolean fullRefund = authorization.getRemainingRefundableAmount().compareTo(amount) == 0;
         authorization.refund(amount);
         authorizationRepository.save(authorization);
 
         CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
-                .orElseThrow(() -> new BadRequestException("Card account not found."));
+                .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
         cardAccount.increaseAvailableAmount(amount);
         cardAccountRepository.save(cardAccount);
         recordTransaction(authorization, fullRefund ? TransactionType.REFUND : TransactionType.PARTIAL_REFUND, amount);
@@ -250,51 +230,59 @@ public class PaymentService {
         );
     }
 
+    /**
+     * Idempotency flow:
+     * 1. Check for existing cached response — return it immediately if found.
+     * 2. Reserve a placeholder in its own REQUIRES_NEW transaction so a DB
+     *    constraint violation never taints the outer EntityManager.
+     * 3. Run the business operation inside the outer @Transactional.
+     * 4. On success: update the placeholder with the response (same outer tx,
+     *    so payment data and idempotency record commit atomically).
+     * 5. On failure: delete the placeholder in a new REQUIRES_NEW transaction
+     *    so the key is available for retries.
+     */
     private PaymentResponse handleIdempotentRequest(String idempotencyKey,
                                                      String requestUri,
                                                      String requestBodyHash,
                                                      Supplier<PaymentResponse> operation) {
-        Optional<IdempotencyKey> existingKey = idempotencyKeyRepository.findByKeyValue(idempotencyKey);
-        if (existingKey.isPresent()) {
-            IdempotencyKey key = existingKey.get();
-            if (!key.getRequestUri().equals(requestUri) || !key.getRequestBodyHash().equals(requestBodyHash)) {
-                throw new BadRequestException("Idempotency key reuse with different request body is not allowed.");
-            }
-            if (key.getResponsePayload().isBlank()) {
-                throw new BadRequestException("Idempotency key is already being processed. Retry later.");
-            }
-            log.debug("Returning cached idempotent response for key={}", idempotencyKey);
-            return deserializeResponse(key.getResponsePayload());
+        Optional<IdempotencyKey> existing = idempotencyKeyRepository.findByKeyValue(idempotencyKey);
+        if (existing.isPresent()) {
+            return resolveExistingKey(existing.get(), requestUri, requestBodyHash);
         }
 
-        IdempotencyKey placeholder = new IdempotencyKey(
-                idempotencyKey,
-                requestUri,
-                requestBodyHash,
-                "",
-                OffsetDateTime.now()
-        );
+        boolean reserved = idempotencyService.tryReservePlaceholder(idempotencyKey, requestUri, requestBodyHash);
+        if (!reserved) {
+            IdempotencyKey concurrent = idempotencyKeyRepository.findByKeyValue(idempotencyKey)
+                    .orElseThrow(() -> new BadRequestException("Idempotency key is already being processed. Retry later."));
+            return resolveExistingKey(concurrent, requestUri, requestBodyHash);
+        }
+
         try {
-            placeholder = idempotencyKeyRepository.save(placeholder);
-        } catch (DataIntegrityViolationException ex) {
-            Optional<IdempotencyKey> conflictingKey = idempotencyKeyRepository.findByKeyValue(idempotencyKey);
-            if (conflictingKey.isPresent()) {
-                IdempotencyKey key = conflictingKey.get();
-                if (!key.getRequestUri().equals(requestUri) || !key.getRequestBodyHash().equals(requestBodyHash)) {
-                    throw new BadRequestException("Idempotency key reuse with different request body is not allowed.");
-                }
-                if (key.getResponsePayload().isBlank()) {
-                    throw new BadRequestException("Idempotency key is already being processed. Retry later.");
-                }
-                return deserializeResponse(key.getResponsePayload());
+            PaymentResponse response = operation.get();
+            IdempotencyKey placeholder = idempotencyKeyRepository.findByKeyValue(idempotencyKey)
+                    .orElseThrow(() -> new IllegalStateException("Idempotency placeholder was unexpectedly removed"));
+            placeholder.setResponsePayload(serializeResponse(response));
+            idempotencyKeyRepository.save(placeholder);
+            return response;
+        } catch (RuntimeException ex) {
+            try {
+                idempotencyService.releaseOnFailure(idempotencyKey);
+            } catch (Exception cleanupEx) {
+                log.warn("Failed to release idempotency placeholder: key={}", idempotencyKey, cleanupEx);
             }
             throw ex;
         }
+    }
 
-        PaymentResponse response = operation.get();
-        placeholder.setResponsePayload(serializeResponse(response));
-        idempotencyKeyRepository.save(placeholder);
-        return response;
+    private PaymentResponse resolveExistingKey(IdempotencyKey key, String requestUri, String requestBodyHash) {
+        if (!key.getRequestUri().equals(requestUri) || !key.getRequestBodyHash().equals(requestBodyHash)) {
+            throw new BadRequestException("Idempotency key reuse with different request body is not allowed.");
+        }
+        if (key.getResponsePayload().isBlank()) {
+            throw new BadRequestException("Idempotency key is already being processed. Retry later.");
+        }
+        log.debug("Returning cached idempotent response for key={}", key.getKeyValue());
+        return deserializeResponse(key.getResponsePayload());
     }
 
     private String generateRequestBodyHash(Object... values) {
@@ -316,26 +304,28 @@ public class PaymentService {
                 authorization.getAuthorizationId(),
                 transactionType,
                 amount,
-                authorization.getStatus().name(),
+                authorization.getStatus(),
                 OffsetDateTime.now()
         ));
     }
 
+    @Transactional(readOnly = true)
     public List<PaymentTransactionResponse> listTransactions(String authorizationId) {
         if (authorizationId == null || authorizationId.isBlank()) {
             throw new BadRequestException("Authorization ID is required.");
         }
-        return paymentTransactionRepository.findByAuthorizationId(authorizationId).stream()
+        return paymentTransactionRepository.findByAuthorizationIdOrderByCreatedAtAsc(authorizationId).stream()
                 .map(this::mapToTransactionResponse)
                 .toList();
     }
 
+    @Transactional(readOnly = true)
     public PaymentResponse getPayment(String authorizationId) {
         if (authorizationId == null || authorizationId.isBlank()) {
             throw new BadRequestException("Authorization ID is required.");
         }
         Authorization authorization = authorizationRepository.findByAuthorizationId(authorizationId)
-                .orElseThrow(() -> new BadRequestException("Authorization not found."));
+                .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
         return mapToResponse(authorization);
     }
 
@@ -351,7 +341,7 @@ public class PaymentService {
 
     private String serializeResponse(PaymentResponse response) {
         try {
-            return OBJECT_MAPPER.writeValueAsString(response);
+            return objectMapper.writeValueAsString(response);
         } catch (JsonProcessingException ex) {
             throw new IllegalStateException("Failed to serialize idempotent response", ex);
         }
@@ -359,7 +349,7 @@ public class PaymentService {
 
     private PaymentResponse deserializeResponse(String payload) {
         try {
-            return OBJECT_MAPPER.readValue(payload, PaymentResponse.class);
+            return objectMapper.readValue(payload, PaymentResponse.class);
         } catch (JsonProcessingException ex) {
             throw new IllegalStateException("Failed to deserialize idempotent response", ex);
         }

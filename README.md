@@ -142,6 +142,14 @@ MySQL Testcontainers로 실제 InnoDB 위에서 레이스를 재현·검증했�
 MySQL 프로파일에서는 Flyway를 활성화해 스키마 변경 이력을 버전 파일(`V1__create_schema.sql`, `V2__create_users_table.sql`)로 관리합니다.
 H2 개발 환경은 `ddl-auto: create-drop`으로 빠른 개발 사이클을 유지합니다.
 
+### 7. 멱등성 재조회의 스냅샷 함정 — 실제 MySQL에서 발견
+
+부하 테스트 환경을 처음으로 실제 MySQL(Flyway + `ddl-auto: validate`)에 올려 보니, 멱등성 처리가 재현율 100%로 실패했습니다.
+원인은 `handleIdempotentRequest`가 (1) 트랜잭션 시작 시 키를 한 번 조회하고 → (2) `REQUIRES_NEW`로 분리된 트랜잭션에서 placeholder를 커밋하고 → (3) 같은 바깥 트랜잭션에서 다시 조회하는 구조였는데,
+InnoDB REPEATABLE READ 하에서는 (3)의 재조회가 (1)에서 이미 고정된 스냅샷을 그대로 쓰기 때문에 방금 커밋된 placeholder가 "없는 것"으로 보였던 것입니다.
+H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검증하지 못해 지금까지 발견되지 않았습니다.
+재조회를 `PESSIMISTIC_WRITE` 락 조회(`findByKeyValueForUpdate`)로 바꿔 스냅샷을 우회하고 항상 최신 커밋을 읽도록 수정했습니다. (자세한 경위: [docs/loadtest-results.md](docs/loadtest-results.md))
+
 ---
 
 ## 검증 (테스트)
@@ -153,6 +161,22 @@ H2 개발 환경은 `ddl-auto: create-drop`으로 빠른 개발 사이클을 유
 | 상태 전이 | 허용된 전이만 성공하고, capture 후 cancel 등 불법 전이 4종은 예외로 차단됨 |
 | 카드 상태 검사 | BLOCKED 카드로 승인 시도 시 거부 |
 | 원장(ledger) 조회 | 거래 기록을 수정 없이 append-only로 쌓고, 히스토리로 조회 |
+
+---
+
+## 부하 테스트: 락이 처리량에 미치는 영향
+
+"비관적 락을 걸면 처리량이 떨어지지 않는가?"에 실측으로 답하기 위해 k6로 벤치마크했습니다. (전체 방법론과 원자료: [docs/loadtest-results.md](docs/loadtest-results.md))
+
+| 시나리오 | 락 | 처리량 | 평균 지연 |
+|---|---|---|---|
+| 같은 카드에 요청 집중 (최악의 경합) | 있음 (현재 코드) | 138 req/s | 457ms |
+| 카드 100개에 요청 분산 (현실적 분산) | 있음 (현재 코드) | 954 req/s | 70ms |
+| 같은 카드에 요청 집중 | 없음 (로컬 실험용, 커밋 안 함) | 193 req/s | 342ms |
+
+- 카드를 분산하면 락을 켠 채로도 **약 6.9배** 처리량이 나옵니다 — 실제 카드사 트래픽은 카드 수가 많아 한 로우에 경합이 몰릴 일이 드뭅니다.
+- 최악의 경합 상황에서 락 제거가 벌어주는 처리량은 **약 40%**로, 커넥션 풀 크기를 늘렸을 때의 개선(50배 이상)에 비하면 작습니다. 즉 병목은 락이 아니라 풀 크기였고, 락은 그 다음 문제였습니다.
+- 락을 빼면 `PaymentServiceMySqlConcurrencyTest`가 검증하는 바로 그 레이스(한도 정합성 붕괴)가 재현되므로, 이 40%는 의도적으로 지불하는 비용입니다.
 
 ---
 

@@ -188,7 +188,7 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 
 > **알려진 실패**: `PaymentServiceMySqlConcurrencyTest`의 4개 테스트 중 `mySqlShouldPreventConcurrentAuthorizationFromExceedingCreditLimit`와 `mySqlShouldSucceedOnFreshIdempotencyKey`(회귀 테스트)는 통과하지만, `mySqlShouldPreventConcurrentPartialRefundOverRefund`와 `mySqlShouldPreserveAllRestoresOnConcurrentCancels` 2건은 현재 15초 타임아웃으로 실패합니다.
 > **원인 진단**: 실제 동시성 버그가 아니라 테스트 설계 문제입니다. `@DataJpaTest`가 테스트 메서드 전체를 하나의 미커밋 트랜잭션으로 감싸는데, 이 두 테스트는 메인 스레드에서 사전 승인/매입을 먼저 실행합니다 — 그 트랜잭션이 아직 열려 있는 채로 백그라운드 스레드 2개를 띄우니, 백그라운드 스레드가 메인 스레드가 쥐고 있는(그리고 절대 커밋하지 않는) 행 락을 영원히 기다리게 됩니다.
-> **왜 지금 안 고쳤나**: 이 두 테스트가 검증하려는 실제 정합성 로직(부분환불 초과 방지, 취소 시 CardAccount 복원)은 코드 변경 없이 그대로 살아있고, 같은 락 메커니즘이 통과하는 한도초과 테스트로 이미 검증되고 있어 릴리즈를 막는 회귀는 아니라고 판단했습니다. 다만 이 두 테스트 자체는 지금 아무것도 증명하지 못하고 있으므로, 다음 우선순위(멱등성 실패 시맨틱스) 작업 때 테스트 구조를 고치는 게 목표입니다 — 설정 코드를 별도 커밋 트랜잭션으로 분리하거나, `@Transactional(propagation = NOT_SUPPORTED)`로 테스트 자체를 감싸지 않게 바꾸는 두 방향을 검토 중입니다.
+> **왜 지금 안 고쳤나**: 이 두 테스트가 검증하려는 실제 정합성 로직(부분환불 초과 방지, 취소 시 CardAccount 복원)은 코드 변경 없이 그대로 살아있고, 같은 락 메커니즘이 통과하는 한도초과 테스트로 이미 검증되고 있어 릴리즈를 막는 회귀는 아니라고 판단했습니다. 다만 이 두 테스트 자체는 지금 아무것도 증명하지 못하는 상태라, 테스트 인프라 개선 항목으로 분류하고 현재 범위 밖에 두었습니다. 해결 방향은 정해져 있습니다 — 설정 코드를 별도 커밋 트랜잭션으로 분리하거나, `@Transactional(propagation = NOT_SUPPORTED)`로 테스트 자체가 트랜잭션을 감싸지 않게 바꾸면 됩니다.
 
 ---
 

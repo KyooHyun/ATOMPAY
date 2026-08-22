@@ -186,6 +186,10 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 | HTTP 레이어 회귀 (MockMvc) | 서비스 계층 테스트로는 못 잡는 종류의 버그(예: `-parameters` 누락으로 인한 `@PathVariable` 400) 방지용, 실제 Spring MVC 디스패치로 승인→조회→감사로그 흐름을 검증 |
 | 멱등성 스냅샷 회귀 (MySQL Testcontainers) | 7번에서 고친 REPEATABLE READ 스냅샷 버그가 재발하지 않는지, 새 멱등성 키로 승인이 성공하는지 검증 |
 
+> **알려진 실패**: `PaymentServiceMySqlConcurrencyTest`의 4개 테스트 중 `mySqlShouldPreventConcurrentAuthorizationFromExceedingCreditLimit`와 `mySqlShouldSucceedOnFreshIdempotencyKey`(회귀 테스트)는 통과하지만, `mySqlShouldPreventConcurrentPartialRefundOverRefund`와 `mySqlShouldPreserveAllRestoresOnConcurrentCancels` 2건은 현재 15초 타임아웃으로 실패합니다.
+> **원인 진단**: 실제 동시성 버그가 아니라 테스트 설계 문제입니다. `@DataJpaTest`가 테스트 메서드 전체를 하나의 미커밋 트랜잭션으로 감싸는데, 이 두 테스트는 메인 스레드에서 사전 승인/매입을 먼저 실행합니다 — 그 트랜잭션이 아직 열려 있는 채로 백그라운드 스레드 2개를 띄우니, 백그라운드 스레드가 메인 스레드가 쥐고 있는(그리고 절대 커밋하지 않는) 행 락을 영원히 기다리게 됩니다.
+> **왜 지금 안 고쳤나**: 이 두 테스트가 검증하려는 실제 정합성 로직(부분환불 초과 방지, 취소 시 CardAccount 복원)은 코드 변경 없이 그대로 살아있고, 같은 락 메커니즘이 통과하는 한도초과 테스트로 이미 검증되고 있어 릴리즈를 막는 회귀는 아니라고 판단했습니다. 다만 이 두 테스트 자체는 지금 아무것도 증명하지 못하고 있으므로, 다음 우선순위(멱등성 실패 시맨틱스) 작업 때 테스트 구조를 고치는 게 목표입니다 — 설정 코드를 별도 커밋 트랜잭션으로 분리하거나, `@Transactional(propagation = NOT_SUPPORTED)`로 테스트 자체를 감싸지 않게 바꾸는 두 방향을 검토 중입니다.
+
 ---
 
 ## 부하 테스트: 락이 처리량에 미치는 영향
@@ -294,12 +298,18 @@ Health 체크: `http://localhost:8080/actuator/health`
 ### 테스트
 
 ```bash
-# 단위 테스트 (H2, Docker 불필요)
+# 전체 테스트 (커밋 전 항상 이걸로 — 개별 -Dtest= 필터만 돌리면
+# 다른 테스트 클래스의 @Import 누락 같은 컨텍스트 로딩 실패를 놓칠 수 있음)
+.\mvnw.cmd clean test
+
+# 단위 테스트만 (H2, Docker 불필요, 빠른 반복용)
 .\mvnw.cmd test -Dtest=PaymentServiceTest
 
-# 동시성 테스트 (MySQL Testcontainers, Docker 필요)
+# 동시성 테스트만 (MySQL Testcontainers, Docker 필요)
 .\mvnw.cmd test -Dtest=PaymentServiceMySqlConcurrencyTest
 ```
+
+`PaymentServiceMySqlConcurrencyTest`의 2건은 현재 실패 상태입니다 — 원인과 판단 근거는 [검증 (테스트)](#검증-테스트) 섹션 참고.
 
 ---
 

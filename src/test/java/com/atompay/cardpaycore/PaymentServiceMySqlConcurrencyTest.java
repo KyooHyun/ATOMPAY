@@ -11,6 +11,7 @@ import com.atompay.cardpaycore.repository.CardAccountRepository;
 import com.atompay.cardpaycore.repository.IdempotencyKeyRepository;
 import com.atompay.cardpaycore.repository.PaymentTransactionRepository;
 import com.atompay.cardpaycore.config.JacksonConfig;
+import com.atompay.cardpaycore.service.AuditLogService;
 import com.atompay.cardpaycore.service.IdempotencyService;
 import com.atompay.cardpaycore.service.PaymentService;
 import org.junit.jupiter.api.Test;
@@ -38,7 +39,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @Testcontainers
 @DataJpaTest
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
-@Import({PaymentService.class, IdempotencyService.class, JacksonConfig.class})
+@Import({PaymentService.class, IdempotencyService.class, AuditLogService.class, JacksonConfig.class})
 class PaymentServiceMySqlConcurrencyTest {
 
     @Container
@@ -79,6 +80,25 @@ class PaymentServiceMySqlConcurrencyTest {
         authorizationRepository.deleteAllInBatch();
         cardAccountRepository.deleteAllInBatch();
         cardAccountRepository.save(new CardAccount("CARD-001", "4111-1111-1111-1111", BigDecimal.valueOf(5_000_000), BigDecimal.valueOf(5_000_000), CardAccountStatus.ACTIVE));
+    }
+
+    /**
+     * Regression test for the idempotency snapshot bug: a fresh key used to
+     * fail deterministically on real MySQL because the re-read after
+     * reserving the placeholder (committed in a sibling REQUIRES_NEW tx) saw
+     * the same REPEATABLE READ snapshot as the initial empty check, so it
+     * never observed the just-committed row. See docs/loadtest-results.md.
+     */
+    @Test
+    void mySqlShouldSucceedOnFreshIdempotencyKey() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(50_000));
+
+        PaymentResponse response = paymentService.authorize(request, "fresh-key-regression");
+
+        assertThat(response.getStatus()).isEqualTo("AUTHORIZED");
+        assertThat(idempotencyKeyRepository.findByKeyValue("fresh-key-regression")).isPresent();
     }
 
     @Test

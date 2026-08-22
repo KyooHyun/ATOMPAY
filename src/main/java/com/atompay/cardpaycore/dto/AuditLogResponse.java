@@ -11,19 +11,23 @@ public class AuditLogResponse {
     private String authorizationId;
     private String cardId;
     private BigDecimal amount;
+    private boolean success;
+    private String failureReason;
     private String requestId;
     private OffsetDateTime createdAt;
 
     public AuditLogResponse() {
     }
 
-    public AuditLogResponse(String actorUsername, TransactionType action, String authorizationId,
-                             String cardId, BigDecimal amount, String requestId, OffsetDateTime createdAt) {
+    public AuditLogResponse(String actorUsername, TransactionType action, String authorizationId, String cardId,
+                             BigDecimal amount, boolean success, String failureReason, String requestId, OffsetDateTime createdAt) {
         this.actorUsername = actorUsername;
         this.action = action;
         this.authorizationId = authorizationId;
         this.cardId = cardId;
         this.amount = amount;
+        this.success = success;
+        this.failureReason = failureReason;
         this.requestId = requestId;
         this.createdAt = createdAt;
     }
@@ -66,6 +70,22 @@ public class AuditLogResponse {
 
     public void setAmount(BigDecimal amount) {
         this.amount = amount;
+    }
+
+    public boolean isSuccess() {
+        return success;
+    }
+
+    public void setSuccess(boolean success) {
+        this.success = success;
+    }
+
+    public String getFailureReason() {
+        return failureReason;
+    }
+
+    public void setFailureReason(String failureReason) {
+        this.failureReason = failureReason;
     }
 
     public String getRequestId() {

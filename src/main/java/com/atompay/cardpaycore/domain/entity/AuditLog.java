@@ -24,14 +24,19 @@ public class AuditLog {
     @JdbcTypeCode(SqlTypes.VARCHAR)
     private TransactionType action;
 
-    @Column(nullable = false)
+    /** Null for a failed authorize attempt -- no authorization exists yet to reference. */
     private String authorizationId;
 
-    @Column(nullable = false)
+    /** Null when the failure happened before the card account was resolved. */
     private String cardId;
 
-    @Column(nullable = false)
+    /** Null when the failure happened before an amount could be attributed (e.g. authorization not found). */
     private BigDecimal amount;
+
+    @Column(nullable = false)
+    private boolean success;
+
+    private String failureReason;
 
     private String requestId;
 
@@ -41,13 +46,15 @@ public class AuditLog {
     protected AuditLog() {
     }
 
-    public AuditLog(String actorUsername, TransactionType action, String authorizationId,
-                     String cardId, BigDecimal amount, String requestId, OffsetDateTime createdAt) {
+    public AuditLog(String actorUsername, TransactionType action, String authorizationId, String cardId,
+                     BigDecimal amount, boolean success, String failureReason, String requestId, OffsetDateTime createdAt) {
         this.actorUsername = actorUsername;
         this.action = action;
         this.authorizationId = authorizationId;
         this.cardId = cardId;
         this.amount = amount;
+        this.success = success;
+        this.failureReason = failureReason;
         this.requestId = requestId;
         this.createdAt = createdAt;
     }
@@ -74,6 +81,14 @@ public class AuditLog {
 
     public BigDecimal getAmount() {
         return amount;
+    }
+
+    public boolean isSuccess() {
+        return success;
+    }
+
+    public String getFailureReason() {
+        return failureReason;
     }
 
     public String getRequestId() {

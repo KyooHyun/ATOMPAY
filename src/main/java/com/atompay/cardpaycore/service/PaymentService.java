@@ -124,112 +124,137 @@ public class PaymentService {
     }
 
     private PaymentResponse createAuthorization(AuthorizeRequest request) {
-        CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(request.getCardId())
-                .orElseThrow(() -> new NotFoundException("Card account not found: " + request.getCardId()));
+        try {
+            CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(request.getCardId())
+                    .orElseThrow(() -> new NotFoundException("Card account not found: " + request.getCardId()));
 
-        if (cardAccount.getStatus() != CardAccountStatus.ACTIVE) {
-            throw new BadRequestException("Card account is not active.");
+            if (cardAccount.getStatus() != CardAccountStatus.ACTIVE) {
+                throw new BadRequestException("Card account is not active.");
+            }
+
+            if (cardAccount.getAvailableAmount().compareTo(request.getAmount()) < 0) {
+                throw new BadRequestException("Available credit limit is insufficient.");
+            }
+
+            cardAccount.deductAvailableAmount(request.getAmount());
+            cardAccountRepository.save(cardAccount);
+
+            String authorizationId = UUID.randomUUID().toString();
+            Authorization authorization = new Authorization(
+                    authorizationId,
+                    cardAccount.getCardId(),
+                    request.getAmount(),
+                    AuthorizationStatus.AUTHORIZED,
+                    BigDecimal.ZERO,
+                    OffsetDateTime.now(),
+                    OffsetDateTime.now()
+            );
+            authorizationRepository.save(authorization);
+            recordTransaction(authorization, TransactionType.AUTHORIZATION, authorization.getAmount());
+            auditLogService.recordSuccess(TransactionType.AUTHORIZATION, authorizationId, cardAccount.getCardId(), authorization.getAmount());
+
+            log.info("Authorization created: authorizationId={}, cardId={}, amount={}",
+                    authorizationId, cardAccount.getCardId(), request.getAmount());
+
+            return mapToResponse(authorization);
+        } catch (RuntimeException ex) {
+            auditLogService.recordFailure(TransactionType.AUTHORIZATION, null, request.getCardId(), request.getAmount(), ex.getMessage());
+            throw ex;
         }
-
-        if (cardAccount.getAvailableAmount().compareTo(request.getAmount()) < 0) {
-            throw new BadRequestException("Available credit limit is insufficient.");
-        }
-
-        cardAccount.deductAvailableAmount(request.getAmount());
-        cardAccountRepository.save(cardAccount);
-
-        String authorizationId = UUID.randomUUID().toString();
-        Authorization authorization = new Authorization(
-                authorizationId,
-                cardAccount.getCardId(),
-                request.getAmount(),
-                AuthorizationStatus.AUTHORIZED,
-                BigDecimal.ZERO,
-                OffsetDateTime.now(),
-                OffsetDateTime.now()
-        );
-        authorizationRepository.save(authorization);
-        recordTransaction(authorization, TransactionType.AUTHORIZATION, authorization.getAmount());
-        auditLogService.record(TransactionType.AUTHORIZATION, authorizationId, cardAccount.getCardId(), authorization.getAmount());
-
-        log.info("Authorization created: authorizationId={}, cardId={}, amount={}",
-                authorizationId, cardAccount.getCardId(), request.getAmount());
-
-        return mapToResponse(authorization);
     }
 
     private PaymentResponse doCapture(String authorizationId, BigDecimal amount) {
-        Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
-                .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
+        try {
+            Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
+                    .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
 
-        authorization.capture(amount);
-        authorizationRepository.save(authorization);
-        recordTransaction(authorization, TransactionType.CAPTURE, amount);
-        auditLogService.record(TransactionType.CAPTURE, authorizationId, authorization.getCardId(), amount);
+            authorization.capture(amount);
+            authorizationRepository.save(authorization);
+            recordTransaction(authorization, TransactionType.CAPTURE, amount);
+            auditLogService.recordSuccess(TransactionType.CAPTURE, authorizationId, authorization.getCardId(), amount);
 
-        log.info("Payment captured: authorizationId={}, amount={}", authorizationId, amount);
+            log.info("Payment captured: authorizationId={}, amount={}", authorizationId, amount);
 
-        return mapToResponse(authorization);
+            return mapToResponse(authorization);
+        } catch (RuntimeException ex) {
+            auditLogService.recordFailure(TransactionType.CAPTURE, authorizationId, null, amount, ex.getMessage());
+            throw ex;
+        }
     }
 
     private PaymentResponse doCancel(String authorizationId) {
-        Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
-                .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
+        try {
+            Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
+                    .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
 
-        authorization.cancel();
-        authorizationRepository.save(authorization);
+            authorization.cancel();
+            authorizationRepository.save(authorization);
 
-        CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
-                .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
-        cardAccount.increaseAvailableAmount(authorization.getAmount());
-        cardAccountRepository.save(cardAccount);
-        recordTransaction(authorization, TransactionType.CANCEL, authorization.getAmount());
-        auditLogService.record(TransactionType.CANCEL, authorizationId, authorization.getCardId(), authorization.getAmount());
+            CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
+                    .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
+            cardAccount.increaseAvailableAmount(authorization.getAmount());
+            cardAccountRepository.save(cardAccount);
+            recordTransaction(authorization, TransactionType.CANCEL, authorization.getAmount());
+            auditLogService.recordSuccess(TransactionType.CANCEL, authorizationId, authorization.getCardId(), authorization.getAmount());
 
-        log.info("Authorization cancelled: authorizationId={}, restoredAmount={}", authorizationId, authorization.getAmount());
+            log.info("Authorization cancelled: authorizationId={}, restoredAmount={}", authorizationId, authorization.getAmount());
 
-        return mapToResponse(authorization);
+            return mapToResponse(authorization);
+        } catch (RuntimeException ex) {
+            auditLogService.recordFailure(TransactionType.CANCEL, authorizationId, null, null, ex.getMessage());
+            throw ex;
+        }
     }
 
     private PaymentResponse doPartialRefund(String authorizationId, BigDecimal amount) {
-        Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
-                .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
+        try {
+            Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
+                    .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
 
-        authorization.partialRefund(amount);
-        authorizationRepository.save(authorization);
+            authorization.partialRefund(amount);
+            authorizationRepository.save(authorization);
 
-        CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
-                .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
-        cardAccount.increaseAvailableAmount(amount);
-        cardAccountRepository.save(cardAccount);
-        recordTransaction(authorization, TransactionType.PARTIAL_REFUND, amount);
-        auditLogService.record(TransactionType.PARTIAL_REFUND, authorizationId, authorization.getCardId(), amount);
+            CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
+                    .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
+            cardAccount.increaseAvailableAmount(amount);
+            cardAccountRepository.save(cardAccount);
+            recordTransaction(authorization, TransactionType.PARTIAL_REFUND, amount);
+            auditLogService.recordSuccess(TransactionType.PARTIAL_REFUND, authorizationId, authorization.getCardId(), amount);
 
-        log.info("Partial refund processed: authorizationId={}, amount={}, totalRefunded={}",
-                authorizationId, amount, authorization.getRefundedAmount());
+            log.info("Partial refund processed: authorizationId={}, amount={}, totalRefunded={}",
+                    authorizationId, amount, authorization.getRefundedAmount());
 
-        return mapToResponse(authorization);
+            return mapToResponse(authorization);
+        } catch (RuntimeException ex) {
+            auditLogService.recordFailure(TransactionType.PARTIAL_REFUND, authorizationId, null, amount, ex.getMessage());
+            throw ex;
+        }
     }
 
     private PaymentResponse doRefund(String authorizationId, BigDecimal amount) {
-        Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
-                .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
+        try {
+            Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
+                    .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
 
-        boolean fullRefund = authorization.getRemainingRefundableAmount().compareTo(amount) == 0;
-        authorization.refund(amount);
-        authorizationRepository.save(authorization);
+            boolean fullRefund = authorization.getRemainingRefundableAmount().compareTo(amount) == 0;
+            authorization.refund(amount);
+            authorizationRepository.save(authorization);
 
-        CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
-                .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
-        cardAccount.increaseAvailableAmount(amount);
-        cardAccountRepository.save(cardAccount);
-        TransactionType refundAction = fullRefund ? TransactionType.REFUND : TransactionType.PARTIAL_REFUND;
-        recordTransaction(authorization, refundAction, amount);
-        auditLogService.record(refundAction, authorizationId, authorization.getCardId(), amount);
+            CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
+                    .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
+            cardAccount.increaseAvailableAmount(amount);
+            cardAccountRepository.save(cardAccount);
+            TransactionType refundAction = fullRefund ? TransactionType.REFUND : TransactionType.PARTIAL_REFUND;
+            recordTransaction(authorization, refundAction, amount);
+            auditLogService.recordSuccess(refundAction, authorizationId, authorization.getCardId(), amount);
 
-        log.info("Refund processed: authorizationId={}, amount={}, full={}", authorizationId, amount, fullRefund);
+            log.info("Refund processed: authorizationId={}, amount={}, full={}", authorizationId, amount, fullRefund);
 
-        return mapToResponse(authorization);
+            return mapToResponse(authorization);
+        } catch (RuntimeException ex) {
+            auditLogService.recordFailure(TransactionType.REFUND, authorizationId, null, amount, ex.getMessage());
+            throw ex;
+        }
     }
 
     private PaymentResponse mapToResponse(Authorization authorization) {
@@ -345,6 +370,8 @@ public class PaymentService {
                         entry.getAuthorizationId(),
                         entry.getCardId(),
                         entry.getAmount(),
+                        entry.isSuccess(),
+                        entry.getFailureReason(),
                         entry.getRequestId(),
                         entry.getCreatedAt()
                 ))

@@ -8,19 +8,21 @@
 - Real MySQL 8.1 (Docker, not H2/mocks), app run standalone via `spring-boot:run` against it, not through the JPA test harness.
 - 100 seeded card accounts (`CARD-LOAD-001`..`100`, `loadtest` Spring profile), each with an effectively unlimited balance so the benchmark never fails on business rules, only on infrastructure limits.
 - Load generator: k6 (Docker), 50 VUs, 30s, hitting `POST /api/v1/payments/authorize`.
+- **Client and server co-located on the same machine** (k6 container + app + MySQL container all on one host, no network hop between them). This is a benchmark of the app/DB path under a fixed amount of local CPU, not a distributed-systems-realistic setup — absolute throughput numbers would differ on separate hardware, but the *relative* comparisons (locked vs unlocked, contention vs distributed) are what this test is actually measuring, and that comparison holds regardless of absolute hardware.
 - Two traffic shapes:
   - **Contention** — all 50 VUs authorize against the *same* card (`CARD-LOAD-001`). Worst case: every request serializes on one row's lock.
   - **Distributed** — each VU pinned to its own card (up to 100 distinct cards). Best case: lock contention is spread thin.
 - Two code variants: the real code (`findByCardIdForUpdate`, `PESSIMISTIC_WRITE`) vs. a temporary local-only edit swapping it for a plain `findByCardId` (no lock), rebuilt, benchmarked, then reverted — never committed.
+- **Measured before rate limiting existed.** A later change (2026-08-22, same day) added a 30-req/10s-per-actor rate limit on `/api/v1/payments/**` ([README §8](../README.md)). These numbers predate that filter and are not reproducible as-is on the current code — a single-actor k6 run now hits 429s almost immediately. To reproduce: temporarily disable `RateLimitFilter` (comment out its `.addFilterAfter(...)` registration in `SecurityConfig`), or have each VU authenticate as a distinct user so they land in separate rate-limit buckets.
 
 ## First run: the bottleneck wasn't the lock at all
 
 With HikariCP's default pool size (10), **both** scenarios collapsed to the same place:
 
-| Scenario | Success rate | Throughput | Avg latency |
-|---|---|---|---|
-| Contention, pool=10 | 30% | 1.75 req/s | 28.4s |
-| Distributed, pool=10 | 23% | 1.82 req/s | 27.4s |
+| Scenario | Success rate | Throughput | Avg latency | p95 |
+|---|---|---|---|---|
+| Contention, pool=10 | 30% | 1.75 req/s | 28.4s | 30.4s |
+| Distributed, pool=10 | 23% | 1.82 req/s | 27.4s | 30.2s |
 
 Identical collapse regardless of card distribution means the lock wasn't the limiting factor yet — 50 concurrent VUs against a 10-connection pool queue on the *pool*, not the row lock. This is itself a useful finding: a lock-contention benchmark is meaningless until the connection pool is sized past the concurrency level you're testing, otherwise you're just measuring the pool.
 
@@ -37,7 +39,7 @@ Identical collapse regardless of card distribution means the lock wasn't the lim
 
 **Reading it:**
 - Distributing across cards is a **~6.9x** throughput gain over hammering one card, with the lock on. That's the realistic case for a real card issuer: millions of cards, so row-lock contention on any single card is rare in practice.
-- Removing the lock buys **~40%** more throughput in the worst case (same-card contention) — real, but far smaller than what fixing the connection pool bought (10 -> 60 was a >50x improvement by itself).
+- Removing the lock buys **~40%** more throughput in the worst case (same-card contention) — real, but far smaller than what fixing the connection pool bought: pool 10→60 was a **~79x** improvement in the contention scenario (1.75 → 138 req/s) and **~524x** in the distributed scenario (1.82 → 954 req/s), both with the lock still on.
 - HikariCP metrics during the runs confirm *why*: in the contention run, ~50 connections sit `active` with `pending=0` — connections are checked out but idle, blocked waiting on the row lock, not queueing for a connection. In the distributed run, `active` pins at the pool max (60) with brief `pending` spikes — the bottleneck there is genuinely "not enough connections for this much real work," a much healthier problem to have.
 
 **Conclusion for the interview question:** "Locking costs about 40% throughput under worst-case single-card contention, and nothing measurable under realistic distributed traffic. That's a trade we take deliberately, because the alternative — proven by `PaymentServiceMySqlConcurrencyTest` — is silently corrupted balances under concurrent requests. The bigger lesson from actually measuring this was that connection pool sizing dominates lock overhead by an order of magnitude, so the pool needs to scale with expected concurrency regardless of the locking strategy."
@@ -46,7 +48,7 @@ Identical collapse regardless of card distribution means the lock wasn't the lim
 
 Getting a real load test running against real MySQL required actually exercising the `mysql` Spring profile end-to-end for the first time — it had only ever been used via H2 (dev) or Testcontainers with `ddl-auto=update` (tests), never via Flyway + `ddl-auto=validate` the way it would run in production. That surfaced:
 
-1. **Critical: idempotency was completely broken on real MySQL.** Every fresh idempotency key deterministically failed with `Idempotency placeholder was unexpectedly removed` — 100% reproduction, not a race. Root cause: the re-read after reserving the placeholder (in a sibling `REQUIRES_NEW` transaction) happened inside the *same* outer transaction whose REPEATABLE READ snapshot was already fixed by an earlier read — so it could never see the just-committed row. Fixed with a `PESSIMISTIC_WRITE` locking re-read (`IdempotencyKeyRepository.findByKeyValueForUpdate`), since InnoDB locking reads bypass the snapshot and always see latest-committed data. This means the API's core payment flows did not work at all against real MySQL before this fix.
+1. **Critical: idempotency was completely broken on real MySQL.** Every fresh idempotency key failed with `Idempotency placeholder was unexpectedly removed` on every manual attempt (verified 3/3 failures via direct HTTP calls before the fix; 3/3 successes after). This isn't a timing-dependent race that shows up occasionally — it's a structural consequence of InnoDB's REPEATABLE READ snapshot semantics, so it reproduces on every fresh-key request, every time. Root cause: the re-read after reserving the placeholder (in a sibling `REQUIRES_NEW` transaction) happened inside the *same* outer transaction whose snapshot was already fixed by an earlier read — so it could never see the just-committed row. Fixed with a `PESSIMISTIC_WRITE` locking re-read (`IdempotencyKeyRepository.findByKeyValueForUpdate`), since InnoDB locking reads bypass the snapshot and always see latest-committed data. This means the API's core payment flows did not work at all against real MySQL before this fix. Now covered by a regression test: `PaymentServiceMySqlConcurrencyTest.mySqlShouldSucceedOnFreshIdempotencyKey`.
 2. `application-mysql.properties` was missing `spring.datasource.driver-class-name`, silently inheriting H2's driver from the base properties file.
 3. Hibernate 6 defaults `@Enumerated(STRING)` fields to the dialect's native `ENUM` column type; the Flyway migrations create `VARCHAR`. Fixed with `@JdbcTypeCode(SqlTypes.VARCHAR)` on all 5 enum-mapped fields.
 4. Same class of mismatch for `IdempotencyKey.responsePayload` (`@Lob String` defaulted to `TINYTEXT` via length inference vs. the migration's `LONGTEXT`) — fixed with `@JdbcTypeCode(SqlTypes.LONGVARCHAR)`.

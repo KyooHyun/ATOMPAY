@@ -7,6 +7,7 @@ import com.atompay.cardpaycore.dto.AmountRequest;
 import com.atompay.cardpaycore.dto.AuthorizeRequest;
 import com.atompay.cardpaycore.dto.PaymentResponse;
 import com.atompay.cardpaycore.dto.PaymentTransactionResponse;
+import com.atompay.cardpaycore.domain.entity.AuditLog;
 import com.atompay.cardpaycore.dto.AuditLogResponse;
 import com.atompay.cardpaycore.exception.BadRequestException;
 import com.atompay.cardpaycore.repository.AuditLogRepository;
@@ -270,6 +271,7 @@ class PaymentServiceTest {
         assertThat(auditLog.get(0).getActorUsername()).isEqualTo("admin");
         assertThat(auditLog.get(0).getAction()).isEqualTo(TransactionType.AUTHORIZATION);
         assertThat(auditLog.get(0).getAmount()).isEqualByComparingTo(BigDecimal.valueOf(100_000));
+        assertThat(auditLog.get(0).isSuccess()).isTrue();
     }
 
     @Test
@@ -283,6 +285,40 @@ class PaymentServiceTest {
         List<AuditLogResponse> auditLog = paymentService.listAuditLog(authorization.getAuthorizationId());
         assertThat(auditLog).hasSize(1);
         assertThat(auditLog.get(0).getActorUsername()).isEqualTo("system");
+    }
+
+    @Test
+    @WithMockUser(username = "admin")
+    void authorizeShouldRecordAuditLogFailureWhenCreditLimitInsufficient() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(10_000_000));
+
+        assertThrows(BadRequestException.class, () -> paymentService.authorize(request, "key-fail"));
+
+        List<AuditLog> auditLog = auditLogRepository.findAll();
+        assertThat(auditLog).hasSize(1);
+        assertThat(auditLog.get(0).isSuccess()).isFalse();
+        assertThat(auditLog.get(0).getAuthorizationId()).isNull();
+        assertThat(auditLog.get(0).getCardId()).isEqualTo("CARD-001");
+        assertThat(auditLog.get(0).getFailureReason()).contains("insufficient");
+    }
+
+    @Test
+    @WithMockUser(username = "admin")
+    void cancelShouldRecordAuditLogFailureWhenAlreadyCaptured() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(100_000));
+        PaymentResponse authorization = paymentService.authorize(request, "key-auth");
+        paymentService.capture(authorization.getAuthorizationId(), BigDecimal.valueOf(100_000), "key-capture");
+
+        assertThrows(IllegalStateException.class,
+                () -> paymentService.cancel(authorization.getAuthorizationId(), "key-cancel"));
+
+        List<AuditLogResponse> auditLog = paymentService.listAuditLog(authorization.getAuthorizationId());
+        assertThat(auditLog).extracting(AuditLogResponse::getAction, AuditLogResponse::isSuccess)
+                .contains(org.assertj.core.groups.Tuple.tuple(TransactionType.CANCEL, false));
     }
 
     @Test

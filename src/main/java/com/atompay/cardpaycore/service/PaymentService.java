@@ -12,6 +12,8 @@ import com.atompay.cardpaycore.dto.PaymentResponse;
 import com.atompay.cardpaycore.dto.PaymentTransactionResponse;
 import com.atompay.cardpaycore.exception.BadRequestException;
 import com.atompay.cardpaycore.exception.NotFoundException;
+import com.atompay.cardpaycore.dto.AuditLogResponse;
+import com.atompay.cardpaycore.repository.AuditLogRepository;
 import com.atompay.cardpaycore.repository.AuthorizationRepository;
 import com.atompay.cardpaycore.repository.CardAccountRepository;
 import com.atompay.cardpaycore.repository.IdempotencyKeyRepository;
@@ -45,19 +47,25 @@ public class PaymentService {
     private final IdempotencyKeyRepository idempotencyKeyRepository;
     private final PaymentTransactionRepository paymentTransactionRepository;
     private final IdempotencyService idempotencyService;
+    private final AuditLogService auditLogService;
+    private final AuditLogRepository auditLogRepository;
 
     public PaymentService(ObjectMapper objectMapper,
                           CardAccountRepository cardAccountRepository,
                           AuthorizationRepository authorizationRepository,
                           IdempotencyKeyRepository idempotencyKeyRepository,
                           PaymentTransactionRepository paymentTransactionRepository,
-                          IdempotencyService idempotencyService) {
+                          IdempotencyService idempotencyService,
+                          AuditLogService auditLogService,
+                          AuditLogRepository auditLogRepository) {
         this.objectMapper = objectMapper;
         this.cardAccountRepository = cardAccountRepository;
         this.authorizationRepository = authorizationRepository;
         this.idempotencyKeyRepository = idempotencyKeyRepository;
         this.paymentTransactionRepository = paymentTransactionRepository;
         this.idempotencyService = idempotencyService;
+        this.auditLogService = auditLogService;
+        this.auditLogRepository = auditLogRepository;
     }
 
     @Transactional
@@ -142,6 +150,7 @@ public class PaymentService {
         );
         authorizationRepository.save(authorization);
         recordTransaction(authorization, TransactionType.AUTHORIZATION, authorization.getAmount());
+        auditLogService.record(TransactionType.AUTHORIZATION, authorizationId, cardAccount.getCardId(), authorization.getAmount());
 
         log.info("Authorization created: authorizationId={}, cardId={}, amount={}",
                 authorizationId, cardAccount.getCardId(), request.getAmount());
@@ -156,6 +165,7 @@ public class PaymentService {
         authorization.capture(amount);
         authorizationRepository.save(authorization);
         recordTransaction(authorization, TransactionType.CAPTURE, amount);
+        auditLogService.record(TransactionType.CAPTURE, authorizationId, authorization.getCardId(), amount);
 
         log.info("Payment captured: authorizationId={}, amount={}", authorizationId, amount);
 
@@ -174,6 +184,7 @@ public class PaymentService {
         cardAccount.increaseAvailableAmount(authorization.getAmount());
         cardAccountRepository.save(cardAccount);
         recordTransaction(authorization, TransactionType.CANCEL, authorization.getAmount());
+        auditLogService.record(TransactionType.CANCEL, authorizationId, authorization.getCardId(), authorization.getAmount());
 
         log.info("Authorization cancelled: authorizationId={}, restoredAmount={}", authorizationId, authorization.getAmount());
 
@@ -192,6 +203,7 @@ public class PaymentService {
         cardAccount.increaseAvailableAmount(amount);
         cardAccountRepository.save(cardAccount);
         recordTransaction(authorization, TransactionType.PARTIAL_REFUND, amount);
+        auditLogService.record(TransactionType.PARTIAL_REFUND, authorizationId, authorization.getCardId(), amount);
 
         log.info("Partial refund processed: authorizationId={}, amount={}, totalRefunded={}",
                 authorizationId, amount, authorization.getRefundedAmount());
@@ -211,7 +223,9 @@ public class PaymentService {
                 .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
         cardAccount.increaseAvailableAmount(amount);
         cardAccountRepository.save(cardAccount);
-        recordTransaction(authorization, fullRefund ? TransactionType.REFUND : TransactionType.PARTIAL_REFUND, amount);
+        TransactionType refundAction = fullRefund ? TransactionType.REFUND : TransactionType.PARTIAL_REFUND;
+        recordTransaction(authorization, refundAction, amount);
+        auditLogService.record(refundAction, authorizationId, authorization.getCardId(), amount);
 
         log.info("Refund processed: authorizationId={}, amount={}, full={}", authorizationId, amount, fullRefund);
 
@@ -316,6 +330,24 @@ public class PaymentService {
         }
         return paymentTransactionRepository.findByAuthorizationIdOrderByCreatedAtAsc(authorizationId).stream()
                 .map(this::mapToTransactionResponse)
+                .toList();
+    }
+
+    @Transactional(readOnly = true)
+    public List<AuditLogResponse> listAuditLog(String authorizationId) {
+        if (authorizationId == null || authorizationId.isBlank()) {
+            throw new BadRequestException("Authorization ID is required.");
+        }
+        return auditLogRepository.findByAuthorizationIdOrderByCreatedAtAsc(authorizationId).stream()
+                .map(entry -> new AuditLogResponse(
+                        entry.getActorUsername(),
+                        entry.getAction(),
+                        entry.getAuthorizationId(),
+                        entry.getCardId(),
+                        entry.getAmount(),
+                        entry.getRequestId(),
+                        entry.getCreatedAt()
+                ))
                 .toList();
     }
 

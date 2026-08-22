@@ -7,18 +7,22 @@ import com.atompay.cardpaycore.dto.AmountRequest;
 import com.atompay.cardpaycore.dto.AuthorizeRequest;
 import com.atompay.cardpaycore.dto.PaymentResponse;
 import com.atompay.cardpaycore.dto.PaymentTransactionResponse;
+import com.atompay.cardpaycore.dto.AuditLogResponse;
 import com.atompay.cardpaycore.exception.BadRequestException;
+import com.atompay.cardpaycore.repository.AuditLogRepository;
 import com.atompay.cardpaycore.repository.AuthorizationRepository;
 import com.atompay.cardpaycore.repository.CardAccountRepository;
 import com.atompay.cardpaycore.repository.IdempotencyKeyRepository;
 import com.atompay.cardpaycore.repository.PaymentTransactionRepository;
 import com.atompay.cardpaycore.config.JacksonConfig;
+import com.atompay.cardpaycore.service.AuditLogService;
 import com.atompay.cardpaycore.service.IdempotencyService;
 import com.atompay.cardpaycore.service.PaymentService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.context.transaction.BeforeTransaction;
 
 import java.math.BigDecimal;
@@ -29,7 +33,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @DataJpaTest
-@Import({PaymentService.class, IdempotencyService.class, JacksonConfig.class})
+@Import({PaymentService.class, IdempotencyService.class, AuditLogService.class, JacksonConfig.class})
 class PaymentServiceTest {
 
     @Autowired
@@ -45,10 +49,14 @@ class PaymentServiceTest {
     private PaymentTransactionRepository paymentTransactionRepository;
 
     @Autowired
+    private AuditLogRepository auditLogRepository;
+
+    @Autowired
     private PaymentService paymentService;
 
     @BeforeTransaction
     void setUp() {
+        auditLogRepository.deleteAllInBatch();
         paymentTransactionRepository.deleteAllInBatch();
         idempotencyKeyRepository.deleteAllInBatch();
         authorizationRepository.deleteAllInBatch();
@@ -244,6 +252,37 @@ class PaymentServiceTest {
         assertThat(transactions).hasSize(2);
         assertThat(transactions).extracting(PaymentTransactionResponse::getTransactionType)
                 .containsExactly(TransactionType.AUTHORIZATION, TransactionType.CAPTURE);
+    }
+
+    // ── Audit log ──────────────────────────────────────────────────────────────
+
+    @Test
+    @WithMockUser(username = "admin")
+    void authorizeShouldRecordAuditLogEntryWithActor() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(100_000));
+
+        PaymentResponse authorization = paymentService.authorize(request, "key-123");
+
+        List<AuditLogResponse> auditLog = paymentService.listAuditLog(authorization.getAuthorizationId());
+        assertThat(auditLog).hasSize(1);
+        assertThat(auditLog.get(0).getActorUsername()).isEqualTo("admin");
+        assertThat(auditLog.get(0).getAction()).isEqualTo(TransactionType.AUTHORIZATION);
+        assertThat(auditLog.get(0).getAmount()).isEqualByComparingTo(BigDecimal.valueOf(100_000));
+    }
+
+    @Test
+    void authorizeWithoutAuthenticationShouldRecordSystemActor() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(100_000));
+
+        PaymentResponse authorization = paymentService.authorize(request, "key-123");
+
+        List<AuditLogResponse> auditLog = paymentService.listAuditLog(authorization.getAuthorizationId());
+        assertThat(auditLog).hasSize(1);
+        assertThat(auditLog.get(0).getActorUsername()).isEqualTo("system");
     }
 
     @Test

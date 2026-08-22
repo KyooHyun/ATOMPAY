@@ -1,6 +1,7 @@
 package com.atompay.cardpaycore.controller;
 
 import com.atompay.cardpaycore.dto.AmountRequest;
+import com.atompay.cardpaycore.dto.AuditLogResponse;
 import com.atompay.cardpaycore.dto.AuthorizeRequest;
 import com.atompay.cardpaycore.dto.PaymentResponse;
 import com.atompay.cardpaycore.dto.PaymentTransactionResponse;
@@ -90,5 +91,11 @@ public class PaymentController {
     @Operation(summary = "Get payment status", description = "Returns the current state, authorized amount, and cumulative refunded amount.")
     public ResponseEntity<PaymentResponse> getPayment(@PathVariable String authorizationId) {
         return ResponseEntity.ok(paymentService.getPayment(authorizationId));
+    }
+
+    @GetMapping("/{authorizationId}/audit-log")
+    @Operation(summary = "List audit log entries", description = "Returns who performed each state change on this authorization, and when.")
+    public ResponseEntity<List<AuditLogResponse>> getAuditLog(@PathVariable String authorizationId) {
+        return ResponseEntity.ok(paymentService.listAuditLog(authorizationId));
     }
 }

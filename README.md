@@ -18,7 +18,7 @@
 | 인증 | Spring Security + JWT (HS256), Stateless 세션 |
 | 스키마 관리 | Flyway 버전 마이그레이션 (MySQL 프로파일) |
 | API 문서 | Swagger UI — `http://localhost:8080/swagger-ui.html` |
-| 검증 | JUnit 단위 테스트 19개(서비스 15 + 레이트리밋 4) + MySQL Testcontainers 동시성 테스트 |
+| 검증 | JUnit 단위 테스트 23개(서비스 17 + 레이트리밋 4 + HTTP 레이어 2) + MySQL Testcontainers 동시성/회귀 테스트 4개 |
 | 운영 가시성 | MDC 기반 X-Request-Id 추적 · SLF4J 구조적 로깅 · Spring Actuator `/actuator/health` |
 | 의도적으로 제외 | 프론트엔드, PG 연동, 정산/대사, 회원 관리 |
 
@@ -68,8 +68,8 @@
 | 공개 엔드포인트 | `/api/v1/auth/**`, `/swagger-ui/**`, `/actuator/health` |
 | 보호 엔드포인트 | 그 외 모든 API |
 | 시크릿 관리 | `JWT_SECRET` 환경변수로 주입, 미설정 시 개발용 기본값 폴백 |
-| 레이트 리밋 | 결제 API(`/api/v1/payments/**`)는 actor(인증된 username, 미인증 요청은 `anonymous` 버킷)당 10초에 30건으로 제한, 초과 시 429 + `Retry-After` |
-| 감사 로그 | 승인/매입/취소/환불마다 actor·시각·금액을 별도 기록 (`GET .../audit-log`) |
+| 레이트 리밋 | 결제 API(`/api/v1/payments/**`)는 actor(인증된 username, 미인증 요청은 `anonymous` 버킷)당 10초에 30건, 로그인(`/api/v1/auth/login`)은 remote IP당 분당 10건으로 제한, 초과 시 429 + `Retry-After` |
+| 감사 로그 | 승인/매입/취소/환불의 성공·실패를 모두 actor·시각·금액과 함께 기록 (`GET .../audit-log`), 실패 기록은 `REQUIRES_NEW`로 별도 커밋 |
 
 ### 테스트 계정
 
@@ -147,11 +147,11 @@ H2 개발 환경은 `ddl-auto: create-drop`으로 빠른 개발 사이클을 유
 
 ### 7. 멱등성 재조회의 스냅샷 함정 — 실제 MySQL에서 발견
 
-부하 테스트 환경을 처음으로 실제 MySQL(Flyway + `ddl-auto: validate`)에 올려 보니, 멱등성 처리가 재현율 100%로 실패했습니다.
+부하 테스트 환경을 처음으로 실제 MySQL(Flyway + `ddl-auto: validate`)에 올려 보니, 새 멱등성 키로 보낸 요청이 실제 HTTP 호출 3회 모두 실패했습니다 — 타이밍에 따라 가끔 터지는 레이스가 아니라, InnoDB REPEATABLE READ 스냅샷의 구조적 귀결이라 매 요청마다 재현됩니다.
 원인은 `handleIdempotentRequest`가 (1) 트랜잭션 시작 시 키를 한 번 조회하고 → (2) `REQUIRES_NEW`로 분리된 트랜잭션에서 placeholder를 커밋하고 → (3) 같은 바깥 트랜잭션에서 다시 조회하는 구조였는데,
-InnoDB REPEATABLE READ 하에서는 (3)의 재조회가 (1)에서 이미 고정된 스냅샷을 그대로 쓰기 때문에 방금 커밋된 placeholder가 "없는 것"으로 보였던 것입니다.
+(3)의 재조회가 (1)에서 이미 고정된 스냅샷을 그대로 쓰기 때문에 방금 커밋된 placeholder가 "없는 것"으로 보였던 것입니다.
 H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검증하지 못해 지금까지 발견되지 않았습니다.
-재조회를 `PESSIMISTIC_WRITE` 락 조회(`findByKeyValueForUpdate`)로 바꿔 스냅샷을 우회하고 항상 최신 커밋을 읽도록 수정했습니다. (자세한 경위: [docs/loadtest-results.md](docs/loadtest-results.md))
+재조회를 `PESSIMISTIC_WRITE` 락 조회(`findByKeyValueForUpdate`)로 바꿔 스냅샷을 우회하고 항상 최신 커밋을 읽도록 수정했고, 회귀 방지용 테스트(`mySqlShouldSucceedOnFreshIdempotencyKey`)를 추가했습니다. (자세한 경위: [docs/loadtest-results.md](docs/loadtest-results.md))
 
 ### 8. 보안 재점검: 레이트 리밋 · 감사 로그 · 시크릿 외부화
 
@@ -161,6 +161,14 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 - **감사 로그 부재**: `X-Request-Id` 상관관계 추적은 있었지만, "누가 승인/취소했는가"라는 금융 감사 관점의 기록은 없었습니다. 비즈니스 원장(`payment_transaction`)과는 별도로 `audit_log` 테이블에 actor·action·금액·요청ID를 기록하고, 조회 API(`GET .../audit-log`)로 노출했습니다.
 - **JWT 시크릿 하드코딩**: `JWT_SECRET` 환경변수로 주입하고, 미설정 시에만 기존 개발용 기본값으로 폴백하도록 바꿨습니다.
 - **덤으로 발견한 버그**: 이 작업을 실제 HTTP로 검증하는 과정에서, `@PathVariable` 엔드포인트 전체(`getPayment`, `capture`, `cancel`, `refund`, 신규 `audit-log` 등)가 Maven 빌드에 `-parameters` 컴파일 옵션이 없어 파라미터 이름을 못 읽고 400을 던지는 걸 발견했습니다. 서비스 계층 테스트만으로는 절대 안 잡히는 종류의 버그입니다. `pom.xml`에 `<parameters>true</parameters>`를 추가해 해결했습니다.
+
+### 9. 8번을 다시 뜯어보고 남은 구멍 세 개를 마저 메움
+
+8번을 끝내고 다시 읽어보니 스스로 앞뒤가 안 맞는 부분들이 있었습니다.
+
+- **로그인에는 레이트 리밋이 없었다**: `/api/v1/payments/**`만 막아뒀는데, 무차별 대입의 표준 표적은 결제 API가 아니라 로그인입니다. 결제 API는 JWT 없이는 애초에 401이라 토큰 없는 공격자는 진입도 못 하는데, 인증을 뚫으려는 시도 자체는 무제한으로 열려 있었던 셈입니다. `RateLimitFilter`가 `/api/v1/auth/login`도 함께 보도록 확장하고, actor를 알 수 없는 시점이라 remote IP 기준으로 분당 10건 제한을 별도로 걸었습니다(같은 `RateLimiter`를 재사용, 인스턴스만 분리).
+- **감사 로그에 성공 사례만 남았다**: 한도 초과, BLOCKED 카드, 불법 상태 전이 같은 실패 시도가 이상거래 관점에서는 오히려 더 중요한데 하나도 안 남고 있었습니다. `AuditLog`에 `success`/`failureReason`을 추가하고, 실패 시에는 `AuditLogService.recordFailure`를 `REQUIRES_NEW`로 별도 커밋해 기록합니다 — 실패로 비즈니스 트랜잭션이 롤백돼도 그 시도 자체의 감사 기록은 살아남아야 하기 때문입니다(성공 기록은 반대로 비즈니스 트랜잭션에 그대로 참여시켜, 결제와 원자적으로 커밋되게 유지했습니다).
+- **회귀 테스트가 없었다**: 7번(멱등성 스냅샷 버그)과 8번의 `-parameters` 버그 둘 다, 고쳤다는 사실만 적어두고 재발 방지 테스트는 없었습니다. 전자는 `PaymentServiceMySqlConcurrencyTest.mySqlShouldSucceedOnFreshIdempotencyKey`로, 후자는 서비스 계층이 아니라 실제 Spring MVC 디스패치를 태우는 `PaymentControllerHttpTest`(MockMvc)로 각각 추가했습니다. 서비스 계층 테스트만으로는 원래 두 버그 다 못 잡는 종류였기 때문에, 검증 계층 자체를 하나 늘린 셈입니다.
 
 ---
 
@@ -173,14 +181,18 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 | 상태 전이 | 허용된 전이만 성공하고, capture 후 cancel 등 불법 전이 4종은 예외로 차단됨 |
 | 카드 상태 검사 | BLOCKED 카드로 승인 시도 시 거부 |
 | 원장(ledger) 조회 | 거래 기록을 수정 없이 append-only로 쌓고, 히스토리로 조회 |
-| 감사 로그 | 인증된 actor로 결제를 수행하면 감사 로그에 actor가 정확히 기록되고, 미인증 컨텍스트에서는 `system`으로 폴백 |
-| 레이트 리밋 | 고정 윈도우 카운터가 한도 도달 후 거부하고, 윈도우 경과 후 리셋됨을 순수 유닛 테스트로 검증 |
+| 감사 로그 | 인증된 actor로 결제를 수행하면 actor가 정확히 기록되고, 미인증 컨텍스트에서는 `system`으로 폴백. 한도 초과·불법 상태 전이 같은 실패 시도도 `success=false`와 사유가 함께 기록됨을 검증 |
+| 레이트 리밋 | 고정 윈도우 카운터가 한도 도달 후 거부하고 윈도우 경과 후 리셋됨을 순수 유닛 테스트로, `RateLimitFilter`가 실제로 결제/로그인 경로에 걸려 429를 돌려주는지는 MockMvc로 각각 검증 |
+| HTTP 레이어 회귀 (MockMvc) | 서비스 계층 테스트로는 못 잡는 종류의 버그(예: `-parameters` 누락으로 인한 `@PathVariable` 400) 방지용, 실제 Spring MVC 디스패치로 승인→조회→감사로그 흐름을 검증 |
+| 멱등성 스냅샷 회귀 (MySQL Testcontainers) | 7번에서 고친 REPEATABLE READ 스냅샷 버그가 재발하지 않는지, 새 멱등성 키로 승인이 성공하는지 검증 |
 
 ---
 
 ## 부하 테스트: 락이 처리량에 미치는 영향
 
 "비관적 락을 걸면 처리량이 떨어지지 않는가?"에 실측으로 답하기 위해 k6로 벤치마크했습니다. (전체 방법론과 원자료: [docs/loadtest-results.md](docs/loadtest-results.md))
+
+> **측정 시점**: 아래 수치는 레이트 리밋 도입 **이전** 커밋 기준입니다. 지금 코드로 그대로 재현하면 actor당 10초 30건 제한에 막혀 대부분 429가 뜹니다. 재현하려면 `SecurityConfig`에서 `RateLimitFilter` 등록을 잠시 빼거나, VU마다 다른 계정으로 로그인해 서로 다른 레이트 리밋 버킷을 쓰게 하세요.
 
 | 시나리오 | 락 | 처리량 | 평균 지연 |
 |---|---|---|---|
@@ -189,7 +201,7 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 | 같은 카드에 요청 집중 | 없음 (로컬 실험용, 커밋 안 함) | 193 req/s | 342ms |
 
 - 카드를 분산하면 락을 켠 채로도 **약 6.9배** 처리량이 나옵니다 — 실제 카드사 트래픽은 카드 수가 많아 한 로우에 경합이 몰릴 일이 드뭅니다.
-- 최악의 경합 상황에서 락 제거가 벌어주는 처리량은 **약 40%**로, 커넥션 풀 크기를 늘렸을 때의 개선(50배 이상)에 비하면 작습니다. 즉 병목은 락이 아니라 풀 크기였고, 락은 그 다음 문제였습니다.
+- 최악의 경합 상황에서 락 제거가 벌어주는 처리량은 **약 40%**로, 커넥션 풀 크기를 늘렸을 때의 개선(경합 시나리오 기준 1.75 → 138 req/s, 약 79배)에 비하면 작습니다. 즉 병목은 락이 아니라 풀 크기였고, 락은 그 다음 문제였습니다.
 - 락을 빼면 `PaymentServiceMySqlConcurrencyTest`가 검증하는 바로 그 레이스(한도 정합성 붕괴)가 재현되므로, 이 40%는 의도적으로 지불하는 비용입니다.
 
 ---
@@ -217,7 +229,7 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 
 - 모든 상태 변경 요청에는 `Idempotency-Key` 헤더가 필요합니다.
 - 외부 식별자(`authorizationId`)는 UUID를 사용해 IDOR를 방지합니다.
-- `/api/v1/payments/**`는 actor당 10초에 30건으로 레이트 리밋됩니다 (초과 시 429).
+- `/api/v1/payments/**`는 actor당 10초에 30건, `/api/v1/auth/login`은 remote IP당 분당 10건으로 레이트 리밋됩니다 (초과 시 429).
 - 요청마다 `X-Request-Id` 헤더를 응답으로 반환합니다.
 
 ---

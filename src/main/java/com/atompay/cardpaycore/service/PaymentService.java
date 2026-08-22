@@ -252,14 +252,14 @@ public class PaymentService {
 
         boolean reserved = idempotencyService.tryReservePlaceholder(idempotencyKey, requestUri, requestBodyHash);
         if (!reserved) {
-            IdempotencyKey concurrent = idempotencyKeyRepository.findByKeyValue(idempotencyKey)
+            IdempotencyKey concurrent = idempotencyKeyRepository.findByKeyValueForUpdate(idempotencyKey)
                     .orElseThrow(() -> new BadRequestException("Idempotency key is already being processed. Retry later."));
             return resolveExistingKey(concurrent, requestUri, requestBodyHash);
         }
 
         try {
             PaymentResponse response = operation.get();
-            IdempotencyKey placeholder = idempotencyKeyRepository.findByKeyValue(idempotencyKey)
+            IdempotencyKey placeholder = idempotencyKeyRepository.findByKeyValueForUpdate(idempotencyKey)
                     .orElseThrow(() -> new IllegalStateException("Idempotency placeholder was unexpectedly removed"));
             placeholder.setResponsePayload(serializeResponse(response));
             idempotencyKeyRepository.save(placeholder);

@@ -2,6 +2,8 @@ package com.atompay.cardpaycore.domain.entity;
 
 import com.atompay.cardpaycore.domain.enums.AuthorizationStatus;
 import jakarta.persistence.*;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 
@@ -24,6 +26,7 @@ public class Authorization {
 
     @Column(nullable = false)
     @Enumerated(EnumType.STRING)
+    @JdbcTypeCode(SqlTypes.VARCHAR)
     private AuthorizationStatus status;
 
     @Column(nullable = false)

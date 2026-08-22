@@ -3,6 +3,8 @@ package com.atompay.cardpaycore.domain.entity;
 import com.atompay.cardpaycore.domain.enums.AuthorizationStatus;
 import com.atompay.cardpaycore.domain.enums.TransactionType;
 import jakarta.persistence.*;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 
@@ -22,6 +24,7 @@ public class PaymentTransaction {
 
     @Column(nullable = false)
     @Enumerated(EnumType.STRING)
+    @JdbcTypeCode(SqlTypes.VARCHAR)
     private TransactionType transactionType;
 
     @Column(nullable = false)
@@ -29,6 +32,7 @@ public class PaymentTransaction {
 
     @Column(nullable = false)
     @Enumerated(EnumType.STRING)
+    @JdbcTypeCode(SqlTypes.VARCHAR)
     private AuthorizationStatus status;
 
     @Column(nullable = false)

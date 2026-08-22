@@ -2,6 +2,8 @@ package com.atompay.cardpaycore.domain.entity;
 
 import com.atompay.cardpaycore.domain.enums.CardAccountStatus;
 import jakarta.persistence.*;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
 import java.math.BigDecimal;
 
 @Entity
@@ -26,6 +28,7 @@ public class CardAccount {
 
     @Column(nullable = false)
     @Enumerated(EnumType.STRING)
+    @JdbcTypeCode(SqlTypes.VARCHAR)
     private CardAccountStatus status;
 
     protected CardAccount() {

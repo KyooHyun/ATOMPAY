@@ -18,7 +18,7 @@
 | 인증 | Spring Security + JWT (HS256), Stateless 세션 |
 | 스키마 관리 | Flyway 버전 마이그레이션 (MySQL 프로파일) |
 | API 문서 | Swagger UI — `http://localhost:8080/swagger-ui.html` |
-| 검증 | JUnit 단위 테스트 13개 + MySQL Testcontainers 동시성 테스트 |
+| 검증 | JUnit 단위 테스트 19개(서비스 15 + 레이트리밋 4) + MySQL Testcontainers 동시성 테스트 |
 | 운영 가시성 | MDC 기반 X-Request-Id 추적 · SLF4J 구조적 로깅 · Spring Actuator `/actuator/health` |
 | 의도적으로 제외 | 프론트엔드, PG 연동, 정산/대사, 회원 관리 |
 
@@ -67,6 +67,9 @@
 | CSRF | REST API 특성상 비활성화 |
 | 공개 엔드포인트 | `/api/v1/auth/**`, `/swagger-ui/**`, `/actuator/health` |
 | 보호 엔드포인트 | 그 외 모든 API |
+| 시크릿 관리 | `JWT_SECRET` 환경변수로 주입, 미설정 시 개발용 기본값 폴백 |
+| 레이트 리밋 | 결제 API(`/api/v1/payments/**`)는 actor(인증된 username, 미인증 요청은 `anonymous` 버킷)당 10초에 30건으로 제한, 초과 시 429 + `Retry-After` |
+| 감사 로그 | 승인/매입/취소/환불마다 actor·시각·금액을 별도 기록 (`GET .../audit-log`) |
 
 ### 테스트 계정
 
@@ -150,6 +153,15 @@ InnoDB REPEATABLE READ 하에서는 (3)의 재조회가 (1)에서 이미 고정�
 H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검증하지 못해 지금까지 발견되지 않았습니다.
 재조회를 `PESSIMISTIC_WRITE` 락 조회(`findByKeyValueForUpdate`)로 바꿔 스냅샷을 우회하고 항상 최신 커밋을 읽도록 수정했습니다. (자세한 경위: [docs/loadtest-results.md](docs/loadtest-results.md))
 
+### 8. 보안 재점검: 레이트 리밋 · 감사 로그 · 시크릿 외부화
+
+"보안"을 프로젝트의 네 기둥 중 하나로 내세운 이상, 실제로 뚫어보고 구멍을 메우는 과정이 필요하다고 판단했습니다.
+
+- **레이트 리밋 부재**: 직전 부하 테스트로 954 req/s가 그대로 들어간다는 걸 스스로 증명해버렸습니다. `/api/v1/payments/**`에 actor(인증된 username)당 고정 윈도우 카운터를 적용해 무차별 승인 시도를 차단합니다. 단일 인스턴스 인메모리 구조라 다중 인스턴스 배포 시에는 Redis 같은 공유 스토어가 필요하다는 한계를 그대로 남겨뒀습니다.
+- **감사 로그 부재**: `X-Request-Id` 상관관계 추적은 있었지만, "누가 승인/취소했는가"라는 금융 감사 관점의 기록은 없었습니다. 비즈니스 원장(`payment_transaction`)과는 별도로 `audit_log` 테이블에 actor·action·금액·요청ID를 기록하고, 조회 API(`GET .../audit-log`)로 노출했습니다.
+- **JWT 시크릿 하드코딩**: `JWT_SECRET` 환경변수로 주입하고, 미설정 시에만 기존 개발용 기본값으로 폴백하도록 바꿨습니다.
+- **덤으로 발견한 버그**: 이 작업을 실제 HTTP로 검증하는 과정에서, `@PathVariable` 엔드포인트 전체(`getPayment`, `capture`, `cancel`, `refund`, 신규 `audit-log` 등)가 Maven 빌드에 `-parameters` 컴파일 옵션이 없어 파라미터 이름을 못 읽고 400을 던지는 걸 발견했습니다. 서비스 계층 테스트만으로는 절대 안 잡히는 종류의 버그입니다. `pom.xml`에 `<parameters>true</parameters>`를 추가해 해결했습니다.
+
 ---
 
 ## 검증 (테스트)
@@ -161,6 +173,8 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 | 상태 전이 | 허용된 전이만 성공하고, capture 후 cancel 등 불법 전이 4종은 예외로 차단됨 |
 | 카드 상태 검사 | BLOCKED 카드로 승인 시도 시 거부 |
 | 원장(ledger) 조회 | 거래 기록을 수정 없이 append-only로 쌓고, 히스토리로 조회 |
+| 감사 로그 | 인증된 actor로 결제를 수행하면 감사 로그에 actor가 정확히 기록되고, 미인증 컨텍스트에서는 `system`으로 폴백 |
+| 레이트 리밋 | 고정 윈도우 카운터가 한도 도달 후 거부하고, 윈도우 경과 후 리셋됨을 순수 유닛 테스트로 검증 |
 
 ---
 
@@ -199,9 +213,11 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 | POST | `/api/v1/payments/{authorizationId}/refund` | 전액 환불 (매입 후) |
 | GET | `/api/v1/payments/{authorizationId}` | 상태·승인 금액·누적 환불액 조회 |
 | GET | `/api/v1/payments/{authorizationId}/transactions` | 거래 히스토리 조회 |
+| GET | `/api/v1/payments/{authorizationId}/audit-log` | 감사 로그 조회 (누가·언제·무엇을) |
 
 - 모든 상태 변경 요청에는 `Idempotency-Key` 헤더가 필요합니다.
 - 외부 식별자(`authorizationId`)는 UUID를 사용해 IDOR를 방지합니다.
+- `/api/v1/payments/**`는 actor당 10초에 30건으로 레이트 리밋됩니다 (초과 시 429).
 - 요청마다 `X-Request-Id` 헤더를 응답으로 반환합니다.
 
 ---
@@ -212,11 +228,13 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 controller   # REST 엔드포인트, Bean Validation(@Valid), OpenAPI 문서
 filter       # CorrelationIdFilter — X-Request-Id MDC 주입
              # JwtAuthenticationFilter — Bearer 토큰 검증 및 SecurityContext 주입
+             # RateLimitFilter — 결제 API actor별 고정 윈도우 레이트 리밋
 security     # JwtTokenProvider — 토큰 생성/검증
+             # RateLimiter — 순수 카운터 로직 (Spring 비의존, 단위 테스트 용이)
 config       # SecurityConfig — 필터 체인, 공개/보호 경로 구성
              # OpenApiConfig — Swagger bearerAuth 스키마 설정
              # DataInitializer — 초기 데이터 시딩 (CARD-001, admin 계정)
-service      # 트랜잭션 경계, 락 획득, 멱등성 처리 조율
+service      # 트랜잭션 경계, 락 획득, 멱등성 처리 조율, 감사 로그 기록(AuditLogService)
 repository   # JPA, 비관적 락 조회(findByAuthorizationIdForUpdate 등)
 domain
  ├─ entity   # 상태 전이 메서드(capture/cancel/refund)와 불변식을 보유

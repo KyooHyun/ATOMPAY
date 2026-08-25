@@ -216,6 +216,33 @@ class PaymentServiceTest {
     }
 
     @Test
+    void partialCaptureShouldPreserveOriginalAuthorizedAmountInLedgerAndAuditLog() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(100_000));
+        PaymentResponse authorization = paymentService.authorize(request, "key-123");
+        paymentService.capture(authorization.getAuthorizationId(), BigDecimal.valueOf(60_000), "key-capture-partial");
+
+        // 현재 상태(Authorization.amount)는 실제 매입액으로 갱신되지만,
+        // 원 승인액과 실제 매입액의 괴리는 원장/감사로그에 append-only로 남아야 한다 —
+        // 이상거래 탐지 관점에서 이 괴리 자체가 신호이기 때문.
+        assertThat(paymentService.getPayment(authorization.getAuthorizationId()).getAmount())
+                .isEqualByComparingTo(BigDecimal.valueOf(60_000));
+
+        assertThat(paymentService.listTransactions(authorization.getAuthorizationId()))
+                .extracting(PaymentTransactionResponse::getTransactionType, PaymentTransactionResponse::getAmount)
+                .containsExactly(
+                        org.assertj.core.groups.Tuple.tuple(TransactionType.AUTHORIZATION, BigDecimal.valueOf(100_000)),
+                        org.assertj.core.groups.Tuple.tuple(TransactionType.CAPTURE, BigDecimal.valueOf(60_000)));
+
+        assertThat(paymentService.listAuditLog(authorization.getAuthorizationId()))
+                .extracting(AuditLogResponse::getAction, AuditLogResponse::getAmount)
+                .containsExactly(
+                        org.assertj.core.groups.Tuple.tuple(TransactionType.AUTHORIZATION, BigDecimal.valueOf(100_000)),
+                        org.assertj.core.groups.Tuple.tuple(TransactionType.CAPTURE, BigDecimal.valueOf(60_000)));
+    }
+
+    @Test
     void partialCaptureShouldBoundSubsequentRefundsByCapturedAmountNotOriginalAuthorization() {
         AuthorizeRequest request = new AuthorizeRequest();
         request.setCardId("CARD-001");

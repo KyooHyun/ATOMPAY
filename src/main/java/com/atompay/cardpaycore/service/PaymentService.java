@@ -4,8 +4,10 @@ import com.atompay.cardpaycore.domain.entity.Authorization;
 import com.atompay.cardpaycore.domain.entity.CardAccount;
 import com.atompay.cardpaycore.domain.entity.IdempotencyKey;
 import com.atompay.cardpaycore.domain.entity.PaymentTransaction;
+import com.atompay.cardpaycore.domain.enums.AuthorizationKind;
 import com.atompay.cardpaycore.domain.enums.AuthorizationStatus;
 import com.atompay.cardpaycore.domain.enums.CardAccountStatus;
+import com.atompay.cardpaycore.domain.enums.DiscountReasonCode;
 import com.atompay.cardpaycore.domain.enums.TransactionType;
 import com.atompay.cardpaycore.dto.AuthorizeRequest;
 import com.atompay.cardpaycore.dto.PaymentResponse;
@@ -70,7 +72,8 @@ public class PaymentService {
 
     @Transactional
     public PaymentResponse authorize(AuthorizeRequest request, String idempotencyKey) {
-        String requestBodyHash = generateRequestBodyHash(request.getCardId(), request.getAmount());
+        String requestBodyHash = generateRequestBodyHash(request.getCardId(), request.getAmount(),
+                request.getOriginalAmount(), request.getDiscountAmount(), request.getDiscountReasonCode());
         return handleIdempotentRequest(
                 idempotencyKey,
                 "/api/v1/payments/authorize",
@@ -125,6 +128,8 @@ public class PaymentService {
 
     private PaymentResponse createAuthorization(AuthorizeRequest request) {
         try {
+            AuthorizationKind kind = validateAndResolveKind(request);
+
             CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(request.getCardId())
                     .orElseThrow(() -> new NotFoundException("Card account not found: " + request.getCardId()));
 
@@ -132,8 +137,8 @@ public class PaymentService {
                 throw new BadRequestException("Card account is not active.");
             }
 
-            boolean isVerificationAuth = request.getAmount().compareTo(BigDecimal.ZERO) == 0;
-            if (!isVerificationAuth) {
+            boolean isZeroCharge = request.getAmount().compareTo(BigDecimal.ZERO) == 0;
+            if (!isZeroCharge) {
                 if (cardAccount.getAvailableAmount().compareTo(request.getAmount()) < 0) {
                     throw new BadRequestException("Available credit limit is insufficient.");
                 }
@@ -149,20 +154,60 @@ public class PaymentService {
                     AuthorizationStatus.AUTHORIZED,
                     BigDecimal.ZERO,
                     OffsetDateTime.now(),
-                    OffsetDateTime.now()
+                    OffsetDateTime.now(),
+                    kind,
+                    request.getOriginalAmount(),
+                    request.getDiscountAmount(),
+                    request.getDiscountReasonCode()
             );
             authorizationRepository.save(authorization);
             recordTransaction(authorization, TransactionType.AUTHORIZATION, authorization.getAmount());
             auditLogService.recordSuccess(TransactionType.AUTHORIZATION, authorizationId, cardAccount.getCardId(), authorization.getAmount());
 
-            log.info("Authorization created: authorizationId={}, cardId={}, amount={}",
-                    authorizationId, cardAccount.getCardId(), request.getAmount());
+            log.info("Authorization created: authorizationId={}, cardId={}, amount={}, kind={}",
+                    authorizationId, cardAccount.getCardId(), request.getAmount(), kind);
 
             return mapToResponse(authorization);
         } catch (RuntimeException ex) {
             auditLogService.recordFailure(TransactionType.AUTHORIZATION, null, request.getCardId(), request.getAmount(), ex.getMessage());
             throw ex;
         }
+    }
+
+    /**
+     * Discount eligibility (e.g. is this cardholder actually a national merit
+     * recipient) is the merchant's responsibility, not the payment core's —
+     * this only checks that a merchant-submitted discount is internally
+     * consistent: all three fields present together, the discount doesn't
+     * exceed the original amount, the arithmetic matches the charged amount,
+     * and the reason code is one this core recognizes.
+     */
+    private AuthorizationKind validateAndResolveKind(AuthorizeRequest request) {
+        boolean hasDiscountFields = request.getOriginalAmount() != null
+                || request.getDiscountAmount() != null
+                || request.getDiscountReasonCode() != null;
+        if (!hasDiscountFields) {
+            return request.getAmount().compareTo(BigDecimal.ZERO) == 0 ? AuthorizationKind.VERIFICATION : AuthorizationKind.STANDARD;
+        }
+        if (request.getOriginalAmount() == null || request.getDiscountAmount() == null
+                || request.getDiscountReasonCode() == null || request.getDiscountReasonCode().isBlank()) {
+            throw new BadRequestException("originalAmount, discountAmount, and discountReasonCode must all be provided together.");
+        }
+        if (request.getDiscountAmount().compareTo(BigDecimal.ZERO) < 0) {
+            throw new BadRequestException("discountAmount must not be negative.");
+        }
+        if (request.getDiscountAmount().compareTo(request.getOriginalAmount()) > 0) {
+            throw new BadRequestException("discountAmount cannot exceed originalAmount.");
+        }
+        if (request.getOriginalAmount().subtract(request.getDiscountAmount()).compareTo(request.getAmount()) != 0) {
+            throw new BadRequestException("originalAmount - discountAmount must equal amount.");
+        }
+        try {
+            DiscountReasonCode.valueOf(request.getDiscountReasonCode());
+        } catch (IllegalArgumentException ex) {
+            throw new BadRequestException("Unknown discountReasonCode: " + request.getDiscountReasonCode());
+        }
+        return request.getAmount().compareTo(BigDecimal.ZERO) == 0 ? AuthorizationKind.DISCOUNTED_ZERO : AuthorizationKind.STANDARD;
     }
 
     private PaymentResponse doCapture(String authorizationId, BigDecimal amount) {
@@ -251,10 +296,12 @@ public class PaymentService {
             authorization.refund(amount);
             authorizationRepository.save(authorization);
 
-            CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
-                    .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
-            cardAccount.increaseAvailableAmount(amount);
-            cardAccountRepository.save(cardAccount);
+            if (amount.compareTo(BigDecimal.ZERO) > 0) {
+                CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
+                        .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
+                cardAccount.increaseAvailableAmount(amount);
+                cardAccountRepository.save(cardAccount);
+            }
             TransactionType refundAction = fullRefund ? TransactionType.REFUND : TransactionType.PARTIAL_REFUND;
             recordTransaction(authorization, refundAction, amount);
             auditLogService.recordSuccess(refundAction, authorizationId, authorization.getCardId(), amount);
@@ -276,7 +323,11 @@ public class PaymentService {
                 authorization.getStatus().name(),
                 authorization.getRefundedAmount(),
                 authorization.getCreatedAt(),
-                authorization.getUpdatedAt()
+                authorization.getUpdatedAt(),
+                authorization.getKind().name(),
+                authorization.getOriginalAmount(),
+                authorization.getDiscountAmount(),
+                authorization.getDiscountReasonCode()
         );
     }
 
@@ -355,7 +406,10 @@ public class PaymentService {
                 transactionType,
                 amount,
                 authorization.getStatus(),
-                OffsetDateTime.now()
+                OffsetDateTime.now(),
+                authorization.getOriginalAmount(),
+                authorization.getDiscountAmount(),
+                authorization.getDiscountReasonCode()
         ));
     }
 
@@ -405,7 +459,10 @@ public class PaymentService {
                 transaction.getTransactionType(),
                 transaction.getAmount(),
                 transaction.getStatus(),
-                transaction.getCreatedAt()
+                transaction.getCreatedAt(),
+                transaction.getOriginalAmount(),
+                transaction.getDiscountAmount(),
+                transaction.getDiscountReasonCode()
         );
     }
 

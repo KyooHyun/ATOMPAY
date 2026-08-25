@@ -1,5 +1,6 @@
 package com.atompay.cardpaycore.domain.entity;
 
+import com.atompay.cardpaycore.domain.enums.AuthorizationKind;
 import com.atompay.cardpaycore.domain.enums.AuthorizationStatus;
 import jakarta.persistence.*;
 import org.hibernate.annotations.JdbcTypeCode;
@@ -38,10 +39,29 @@ public class Authorization {
     @Column(nullable = false)
     private OffsetDateTime updatedAt;
 
+    @Column(nullable = false)
+    @Enumerated(EnumType.STRING)
+    @JdbcTypeCode(SqlTypes.VARCHAR)
+    private AuthorizationKind kind;
+
+    /** Pre-discount amount the merchant originally charged; set only when {@code kind == DISCOUNTED_ZERO}. */
+    @Column
+    private BigDecimal originalAmount;
+
+    /** Amount waived by the discount; set only when {@code kind == DISCOUNTED_ZERO}. */
+    @Column
+    private BigDecimal discountAmount;
+
+    /** Merchant-submitted reason code for the discount; set only when {@code kind == DISCOUNTED_ZERO}. */
+    @Column
+    private String discountReasonCode;
+
     protected Authorization() {
     }
 
-    public Authorization(String authorizationId, String cardId, BigDecimal amount, AuthorizationStatus status, BigDecimal refundedAmount, OffsetDateTime createdAt, OffsetDateTime updatedAt) {
+    public Authorization(String authorizationId, String cardId, BigDecimal amount, AuthorizationStatus status,
+                          BigDecimal refundedAmount, OffsetDateTime createdAt, OffsetDateTime updatedAt,
+                          AuthorizationKind kind, BigDecimal originalAmount, BigDecimal discountAmount, String discountReasonCode) {
         this.authorizationId = authorizationId;
         this.cardId = cardId;
         this.amount = amount;
@@ -49,6 +69,10 @@ public class Authorization {
         this.refundedAmount = refundedAmount;
         this.createdAt = createdAt;
         this.updatedAt = updatedAt;
+        this.kind = kind;
+        this.originalAmount = originalAmount;
+        this.discountAmount = discountAmount;
+        this.discountReasonCode = discountReasonCode;
     }
 
     public Long getId() {
@@ -85,6 +109,22 @@ public class Authorization {
 
     public OffsetDateTime getUpdatedAt() {
         return updatedAt;
+    }
+
+    public AuthorizationKind getKind() {
+        return kind;
+    }
+
+    public BigDecimal getOriginalAmount() {
+        return originalAmount;
+    }
+
+    public BigDecimal getDiscountAmount() {
+        return discountAmount;
+    }
+
+    public String getDiscountReasonCode() {
+        return discountReasonCode;
     }
 
     /**
@@ -138,18 +178,32 @@ public class Authorization {
         this.updatedAt = OffsetDateTime.now();
     }
 
+    /**
+     * A DISCOUNTED_ZERO authorization has no money to refund (charge is 0),
+     * but the transaction — and the discount usage it represents — still
+     * needs to be reversible. {@code refund(ZERO)} is only valid for that
+     * kind: it flips status to REFUNDED without touching refundedAmount,
+     * since there is nothing to add. Every other kind still requires a
+     * positive refund amount, same as before.
+     */
     public void refund(BigDecimal amount) {
-        if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) {
-            throw new IllegalArgumentException("Refund amount must be positive.");
+        if (amount == null || amount.compareTo(BigDecimal.ZERO) < 0) {
+            throw new IllegalArgumentException("Refund amount must not be negative.");
         }
         if (status != AuthorizationStatus.CAPTURED && status != AuthorizationStatus.PARTIALLY_REFUNDED) {
             throw new IllegalStateException("Only captured or partially refunded payments can be refunded.");
+        }
+        boolean isDiscountReversal = amount.compareTo(BigDecimal.ZERO) == 0 && kind == AuthorizationKind.DISCOUNTED_ZERO;
+        if (amount.compareTo(BigDecimal.ZERO) == 0 && !isDiscountReversal) {
+            throw new IllegalArgumentException("Refund amount must be positive.");
         }
         if (amount.compareTo(getRemainingRefundableAmount()) > 0) {
             throw new IllegalArgumentException("Refund amount cannot exceed the remaining refundable amount.");
         }
         boolean fullRefund = amount.compareTo(getRemainingRefundableAmount()) == 0;
-        addRefundedAmount(amount);
+        if (!isDiscountReversal) {
+            addRefundedAmount(amount);
+        }
         this.status = fullRefund ? AuthorizationStatus.REFUNDED : AuthorizationStatus.PARTIALLY_REFUNDED;
         this.updatedAt = OffsetDateTime.now();
     }

@@ -181,6 +181,117 @@ class PaymentServiceTest {
                 .isEqualByComparingTo(BigDecimal.valueOf(5_000_000));
     }
 
+    // ── Discounted-zero authorization (merchant-submitted waiver, e.g. 국가유공자) ──
+
+    private AuthorizeRequest discountedRequest(BigDecimal originalAmount, BigDecimal discountAmount, BigDecimal amount, String reasonCode) {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(amount);
+        request.setOriginalAmount(originalAmount);
+        request.setDiscountAmount(discountAmount);
+        request.setDiscountReasonCode(reasonCode);
+        return request;
+    }
+
+    @Test
+    void authorizeShouldAcceptFullDiscountToZeroWithoutTouchingAvailableAmount() {
+        AuthorizeRequest request = discountedRequest(BigDecimal.valueOf(30_000), BigDecimal.valueOf(30_000), BigDecimal.ZERO, "NATIONAL_MERIT_RECIPIENT");
+
+        PaymentResponse response = paymentService.authorize(request, "key-discount-1");
+
+        assertThat(response.getStatus()).isEqualTo("AUTHORIZED");
+        assertThat(response.getKind()).isEqualTo("DISCOUNTED_ZERO");
+        assertThat(response.getAmount()).isEqualByComparingTo(BigDecimal.ZERO);
+        assertThat(response.getOriginalAmount()).isEqualByComparingTo(BigDecimal.valueOf(30_000));
+        assertThat(response.getDiscountAmount()).isEqualByComparingTo(BigDecimal.valueOf(30_000));
+        assertThat(response.getDiscountReasonCode()).isEqualTo("NATIONAL_MERIT_RECIPIENT");
+        assertThat(cardAccountRepository.findByCardId("CARD-001").get().getAvailableAmount())
+                .isEqualByComparingTo(BigDecimal.valueOf(5_000_000));
+    }
+
+    @Test
+    void authorizeShouldRejectDiscountArithmeticMismatch() {
+        // 30,000 - 20,000 = 10,000, but charged amount claims 0
+        AuthorizeRequest request = discountedRequest(BigDecimal.valueOf(30_000), BigDecimal.valueOf(20_000), BigDecimal.ZERO, "NATIONAL_MERIT_RECIPIENT");
+
+        assertThrows(BadRequestException.class, () -> paymentService.authorize(request, "key-discount-mismatch"));
+    }
+
+    @Test
+    void authorizeShouldRejectDiscountExceedingOriginalAmount() {
+        AuthorizeRequest request = discountedRequest(BigDecimal.valueOf(10_000), BigDecimal.valueOf(20_000), BigDecimal.ZERO, "NATIONAL_MERIT_RECIPIENT");
+
+        assertThrows(BadRequestException.class, () -> paymentService.authorize(request, "key-discount-exceeds"));
+    }
+
+    @Test
+    void authorizeShouldRejectUnknownDiscountReasonCode() {
+        AuthorizeRequest request = discountedRequest(BigDecimal.valueOf(30_000), BigDecimal.valueOf(30_000), BigDecimal.ZERO, "MADE_UP_CODE");
+
+        assertThrows(BadRequestException.class, () -> paymentService.authorize(request, "key-discount-badcode"));
+    }
+
+    @Test
+    void authorizeShouldRejectPartialDiscountFields() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.ZERO);
+        request.setDiscountAmount(BigDecimal.valueOf(30_000)); // originalAmount/reasonCode missing
+
+        assertThrows(BadRequestException.class, () -> paymentService.authorize(request, "key-discount-partial"));
+    }
+
+    @Test
+    void verificationAndDiscountedZeroAuthorizationsShouldBeDistinguishableInTheLedger() {
+        AuthorizeRequest verification = new AuthorizeRequest();
+        verification.setCardId("CARD-001");
+        verification.setAmount(BigDecimal.ZERO);
+        PaymentResponse verificationAuth = paymentService.authorize(verification, "key-verification");
+
+        AuthorizeRequest discounted = discountedRequest(BigDecimal.valueOf(30_000), BigDecimal.valueOf(30_000), BigDecimal.ZERO, "NATIONAL_MERIT_RECIPIENT");
+        PaymentResponse discountedAuth = paymentService.authorize(discounted, "key-discounted");
+
+        assertThat(verificationAuth.getKind()).isEqualTo("VERIFICATION");
+        assertThat(verificationAuth.getOriginalAmount()).isNull();
+
+        assertThat(discountedAuth.getKind()).isEqualTo("DISCOUNTED_ZERO");
+        assertThat(discountedAuth.getOriginalAmount()).isEqualByComparingTo(BigDecimal.valueOf(30_000));
+
+        assertThat(paymentService.listTransactions(verificationAuth.getAuthorizationId()))
+                .extracting(PaymentTransactionResponse::getOriginalAmount)
+                .containsExactly((BigDecimal) null);
+        assertThat(paymentService.listTransactions(discountedAuth.getAuthorizationId()))
+                .extracting(PaymentTransactionResponse::getOriginalAmount)
+                .containsExactly(BigDecimal.valueOf(30_000));
+    }
+
+    @Test
+    void discountedZeroAuthorizationCaptureAndRefundShouldReverseWithoutTouchingAvailableAmount() {
+        AuthorizeRequest request = discountedRequest(BigDecimal.valueOf(30_000), BigDecimal.valueOf(30_000), BigDecimal.ZERO, "NATIONAL_MERIT_RECIPIENT");
+        PaymentResponse authorization = paymentService.authorize(request, "key-discount-lifecycle");
+
+        PaymentResponse captureResponse = paymentService.capture(authorization.getAuthorizationId(), BigDecimal.ZERO, "key-discount-capture");
+        assertThat(captureResponse.getStatus()).isEqualTo("CAPTURED");
+
+        PaymentResponse refundResponse = paymentService.refund(authorization.getAuthorizationId(), BigDecimal.ZERO, "key-discount-refund");
+        assertThat(refundResponse.getStatus()).isEqualTo("REFUNDED");
+
+        assertThat(cardAccountRepository.findByCardId("CARD-001").get().getAvailableAmount())
+                .isEqualByComparingTo(BigDecimal.valueOf(5_000_000));
+    }
+
+    @Test
+    void verificationAuthorizationShouldRejectZeroAmountRefund() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.ZERO);
+        PaymentResponse authorization = paymentService.authorize(request, "key-verification-refund");
+        paymentService.capture(authorization.getAuthorizationId(), BigDecimal.ZERO, "key-verification-refund-capture");
+
+        assertThrows(IllegalArgumentException.class,
+                () -> paymentService.refund(authorization.getAuthorizationId(), BigDecimal.ZERO, "key-verification-refund-attempt"));
+    }
+
     // ── Capture ────────────────────────────────────────────────────────────────
 
     @Test

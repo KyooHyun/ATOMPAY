@@ -11,12 +11,17 @@ public class PaymentResponse {
     private BigDecimal refundedAmount;
     private OffsetDateTime createdAt;
     private OffsetDateTime updatedAt;
+    private String kind;
+    private BigDecimal originalAmount;
+    private BigDecimal discountAmount;
+    private String discountReasonCode;
 
     public PaymentResponse() {
     }
 
     public PaymentResponse(String authorizationId, String cardId, BigDecimal amount, String status,
-                           BigDecimal refundedAmount, OffsetDateTime createdAt, OffsetDateTime updatedAt) {
+                           BigDecimal refundedAmount, OffsetDateTime createdAt, OffsetDateTime updatedAt,
+                           String kind, BigDecimal originalAmount, BigDecimal discountAmount, String discountReasonCode) {
         this.authorizationId = authorizationId;
         this.cardId = cardId;
         this.amount = amount;
@@ -24,6 +29,10 @@ public class PaymentResponse {
         this.refundedAmount = refundedAmount;
         this.createdAt = createdAt;
         this.updatedAt = updatedAt;
+        this.kind = kind;
+        this.originalAmount = originalAmount;
+        this.discountAmount = discountAmount;
+        this.discountReasonCode = discountReasonCode;
     }
 
     public String getAuthorizationId() {
@@ -80,5 +89,37 @@ public class PaymentResponse {
 
     public void setUpdatedAt(OffsetDateTime updatedAt) {
         this.updatedAt = updatedAt;
+    }
+
+    public String getKind() {
+        return kind;
+    }
+
+    public void setKind(String kind) {
+        this.kind = kind;
+    }
+
+    public BigDecimal getOriginalAmount() {
+        return originalAmount;
+    }
+
+    public void setOriginalAmount(BigDecimal originalAmount) {
+        this.originalAmount = originalAmount;
+    }
+
+    public BigDecimal getDiscountAmount() {
+        return discountAmount;
+    }
+
+    public void setDiscountAmount(BigDecimal discountAmount) {
+        this.discountAmount = discountAmount;
+    }
+
+    public String getDiscountReasonCode() {
+        return discountReasonCode;
+    }
+
+    public void setDiscountReasonCode(String discountReasonCode) {
+        this.discountReasonCode = discountReasonCode;
     }
 }

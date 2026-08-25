@@ -22,6 +22,20 @@ public class AuthorizeRequest {
     @DecimalMax(value = "999999.99", message = "amount exceeds the maximum transaction threshold")
     private BigDecimal amount;
 
+    /**
+     * originalAmount/discountAmount/discountReasonCode are optional and only
+     * used together, when a merchant submits a discount that waives (part
+     * of) the charge — e.g. a national-merit-recipient fee waiver. The
+     * payment core does not decide discount eligibility; it only validates
+     * that originalAmount - discountAmount == amount and that the reason
+     * code is a known one. See {@link com.atompay.cardpaycore.service.PaymentService}.
+     */
+    private BigDecimal originalAmount;
+
+    private BigDecimal discountAmount;
+
+    private String discountReasonCode;
+
     public AuthorizeRequest() {
     }
 
@@ -39,5 +53,29 @@ public class AuthorizeRequest {
 
     public void setAmount(BigDecimal amount) {
         this.amount = amount;
+    }
+
+    public BigDecimal getOriginalAmount() {
+        return originalAmount;
+    }
+
+    public void setOriginalAmount(BigDecimal originalAmount) {
+        this.originalAmount = originalAmount;
+    }
+
+    public BigDecimal getDiscountAmount() {
+        return discountAmount;
+    }
+
+    public void setDiscountAmount(BigDecimal discountAmount) {
+        this.discountAmount = discountAmount;
+    }
+
+    public String getDiscountReasonCode() {
+        return discountReasonCode;
+    }
+
+    public void setDiscountReasonCode(String discountReasonCode) {
+        this.discountReasonCode = discountReasonCode;
     }
 }

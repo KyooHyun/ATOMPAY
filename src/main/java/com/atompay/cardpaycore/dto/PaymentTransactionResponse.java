@@ -12,6 +12,9 @@ public class PaymentTransactionResponse {
     private BigDecimal amount;
     private AuthorizationStatus status;
     private OffsetDateTime createdAt;
+    private BigDecimal originalAmount;
+    private BigDecimal discountAmount;
+    private String discountReasonCode;
 
     public PaymentTransactionResponse() {
     }
@@ -20,12 +23,18 @@ public class PaymentTransactionResponse {
                                       TransactionType transactionType,
                                       BigDecimal amount,
                                       AuthorizationStatus status,
-                                      OffsetDateTime createdAt) {
+                                      OffsetDateTime createdAt,
+                                      BigDecimal originalAmount,
+                                      BigDecimal discountAmount,
+                                      String discountReasonCode) {
         this.transactionId = transactionId;
         this.transactionType = transactionType;
         this.amount = amount;
         this.status = status;
         this.createdAt = createdAt;
+        this.originalAmount = originalAmount;
+        this.discountAmount = discountAmount;
+        this.discountReasonCode = discountReasonCode;
     }
 
     public String getTransactionId() {
@@ -66,5 +75,29 @@ public class PaymentTransactionResponse {
 
     public void setCreatedAt(OffsetDateTime createdAt) {
         this.createdAt = createdAt;
+    }
+
+    public BigDecimal getOriginalAmount() {
+        return originalAmount;
+    }
+
+    public void setOriginalAmount(BigDecimal originalAmount) {
+        this.originalAmount = originalAmount;
+    }
+
+    public BigDecimal getDiscountAmount() {
+        return discountAmount;
+    }
+
+    public void setDiscountAmount(BigDecimal discountAmount) {
+        this.discountAmount = discountAmount;
+    }
+
+    public String getDiscountReasonCode() {
+        return discountReasonCode;
+    }
+
+    public void setDiscountReasonCode(String discountReasonCode) {
+        this.discountReasonCode = discountReasonCode;
     }
 }

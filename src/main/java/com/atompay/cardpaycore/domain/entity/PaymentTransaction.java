@@ -38,16 +38,37 @@ public class PaymentTransaction {
     @Column(nullable = false)
     private OffsetDateTime createdAt;
 
+    /** Pre-discount amount for a DISCOUNTED_ZERO authorization's AUTHORIZATION row; null otherwise. */
+    @Column
+    private BigDecimal originalAmount;
+
+    /** Amount waived for a DISCOUNTED_ZERO authorization's AUTHORIZATION row; null otherwise. */
+    @Column
+    private BigDecimal discountAmount;
+
+    /** Discount reason code for a DISCOUNTED_ZERO authorization's AUTHORIZATION row; null otherwise. */
+    @Column
+    private String discountReasonCode;
+
     protected PaymentTransaction() {
     }
 
     public PaymentTransaction(String transactionId, String authorizationId, TransactionType transactionType, BigDecimal amount, AuthorizationStatus status, OffsetDateTime createdAt) {
+        this(transactionId, authorizationId, transactionType, amount, status, createdAt, null, null, null);
+    }
+
+    public PaymentTransaction(String transactionId, String authorizationId, TransactionType transactionType,
+                               BigDecimal amount, AuthorizationStatus status, OffsetDateTime createdAt,
+                               BigDecimal originalAmount, BigDecimal discountAmount, String discountReasonCode) {
         this.transactionId = transactionId;
         this.authorizationId = authorizationId;
         this.transactionType = transactionType;
         this.amount = amount;
         this.status = status;
         this.createdAt = createdAt;
+        this.originalAmount = originalAmount;
+        this.discountAmount = discountAmount;
+        this.discountReasonCode = discountReasonCode;
     }
 
     public Long getId() {
@@ -76,5 +97,17 @@ public class PaymentTransaction {
 
     public OffsetDateTime getCreatedAt() {
         return createdAt;
+    }
+
+    public BigDecimal getOriginalAmount() {
+        return originalAmount;
+    }
+
+    public BigDecimal getDiscountAmount() {
+        return discountAmount;
+    }
+
+    public String getDiscountReasonCode() {
+        return discountReasonCode;
     }
 }

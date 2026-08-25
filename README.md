@@ -18,7 +18,7 @@
 | 인증 | Spring Security + JWT (HS256), Stateless 세션 |
 | 스키마 관리 | Flyway 버전 마이그레이션 (MySQL 프로파일) |
 | API 문서 | Swagger UI — `http://localhost:8080/swagger-ui.html` |
-| 검증 | JUnit 단위 테스트 23개(서비스 17 + 레이트리밋 4 + HTTP 레이어 2) + MySQL Testcontainers 동시성/회귀 테스트 4개 |
+| 검증 | JUnit 단위 테스트 27개(서비스 21 + 레이트리밋 4 + HTTP 레이어 2) + MySQL Testcontainers 동시성/회귀 테스트 4개 |
 | 운영 가시성 | MDC 기반 X-Request-Id 추적 · SLF4J 구조적 로깅 · Spring Actuator `/actuator/health` |
 | 의도적으로 제외 | 프론트엔드, PG 연동, 정산/대사, 회원 관리 |
 
@@ -101,6 +101,8 @@
 - 환불은 `Authorization.refundedAmount`를 누적 관리하며, 누적 환불액이 매입액을 초과할 수 없습니다.
 - 금액은 부동소수점 오차를 피하기 위해 `BigDecimal` 기반으로 다루고, `capture액 = 승인액`, `누적 환불 ≤ 매입액` 불변식을 엔티티에서 강제합니다.
 - 불법 전이(예: `CAPTURED`에서 `cancel`)는 예외를 던져 차단합니다.
+- **부분환불이 잔액을 정확히 소진시키는 경계**: `partialRefund`는 남은 환불 가능액과 같거나 큰 금액을 명시적으로 거부합니다(`Authorization.partialRefund`). 잔액을 전부 비우는 요청은 `PARTIALLY_REFUNDED`가 아니라 `refund` 경로로 유도되어 `REFUNDED`로 귀결되게 했습니다 — "환불액이 매입액과 같아지면 그게 부분환불인가 전액환불인가"라는 애매함을 API 계약(엔드포인트 선택)으로 해소한 것입니다.
+- **0원 승인(카드 검증)**: 승인 금액 0은 카드 유효성만 확인하고 한도는 건드리지 않는 별도 도메인 케이스로 취급합니다(카드사가 계좌 검증·토큰화 시 실제로 쓰는 방식). `CardAccount.deductAvailableAmount`/`increaseAvailableAmount`는 여전히 양수만 받으므로, 서비스 레이어(`PaymentService`)에서 금액이 0이면 이 호출 자체를 건너뜁니다 — 카드 상태(`ACTIVE`/`BLOCKED`) 검증은 금액과 무관하게 항상 수행되므로 BLOCKED 카드는 0원 승인도 그대로 거부됩니다.
 
 ---
 
@@ -170,6 +172,13 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 - **감사 로그에 성공 사례만 남았다**: 한도 초과, BLOCKED 카드, 불법 상태 전이 같은 실패 시도가 이상거래 관점에서는 오히려 더 중요한데 하나도 안 남고 있었습니다. `AuditLog`에 `success`/`failureReason`을 추가하고, 실패 시에는 `AuditLogService.recordFailure`를 `REQUIRES_NEW`로 별도 커밋해 기록합니다 — 실패로 비즈니스 트랜잭션이 롤백돼도 그 시도 자체의 감사 기록은 살아남아야 하기 때문입니다(성공 기록은 반대로 비즈니스 트랜잭션에 그대로 참여시켜, 결제와 원자적으로 커밋되게 유지했습니다).
 - **회귀 테스트가 없었다**: 7번(멱등성 스냅샷 버그)과 8번의 `-parameters` 버그 둘 다, 고쳤다는 사실만 적어두고 재발 방지 테스트는 없었습니다. 전자는 `PaymentServiceMySqlConcurrencyTest.mySqlShouldSucceedOnFreshIdempotencyKey`로, 후자는 서비스 계층이 아니라 실제 Spring MVC 디스패치를 태우는 `PaymentControllerHttpTest`(MockMvc)로 각각 추가했습니다. 서비스 계층 테스트만으로는 원래 두 버그 다 못 잡는 종류였기 때문에, 검증 계층 자체를 하나 늘린 셈입니다.
 
+### 10. 기술적 예외만 있고 카드 결제 도메인 예외는 없었다
+
+동시성 락, 멱등성 재조회, 트랜잭션 경계 — 지금까지 다룬 예외는 전부 "어떤 도메인이든 똑같이 생기는" 기술적 예외였습니다. 카드 결제라는 도메인 자체에서만 나오는 판단은 없었습니다.
+
+- **0원 승인(카드 검증)**: 카드사는 실제로 금액 0인 승인을 카드 유효성 검증(계좌 검증, 토큰화)에 씁니다 — 돈은 안 움직이지만 카드 상태(BLOCKED 여부 등)는 그대로 검증해야 하는, 일반적인 "금액 검증" 로직과는 다른 케이스입니다. 기존 코드는 `@Positive` 검증으로 0을 음수와 똑같이 걷어차 이 케이스 자체가 존재할 수 없었습니다. `@PositiveOrZero`로 바꾸고, `PaymentService`에서 금액이 0이면 `CardAccount`의 한도 차감/복원 호출 자체를 건너뛰도록(그 메서드들은 여전히 양수만 받음) 분기했습니다. 카드 상태 검증은 금액과 무관하게 항상 먼저 실행되므로, BLOCKED 카드는 0원 승인도 그대로 거부됩니다.
+- **부분환불/전액환불 경계는 이미 해결되어 있었다**: `partialRefund`가 남은 환불 가능액과 같거나 큰 금액을 명시적으로 거부하고, 전액 환불은 `refund` 엔드포인트로만 가능하게 되어 있어 "환불 후 잔액이 0이면 REFUNDED인가 PARTIALLY_REFUNDED인가"라는 경계가 API 계약 수준에서 이미 정리돼 있었습니다. 새로 구현할 게 아니라, 왜 이렇게 설계했는지를 이 문서에 명시하는 게 남은 일이었습니다.
+
 ---
 
 ## 검증 (테스트)
@@ -180,15 +189,16 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 | 멱등성 재시도 | 같은 키 재시도 시 중복 처리 없이 동일 응답 반환, 다른 본문 동일 키는 거부 |
 | 상태 전이 | 허용된 전이만 성공하고, capture 후 cancel 등 불법 전이 4종은 예외로 차단됨 |
 | 카드 상태 검사 | BLOCKED 카드로 승인 시도 시 거부 |
+| 0원 승인(카드 검증) | 0원 승인은 한도를 차감하지 않고 성공하며, BLOCKED 카드는 금액이 0이어도 그대로 거부됨을 검증. 0원 승인의 capture(0)·cancel도 한도 필드를 건드리지 않고 정상 동작함을 검증 |
 | 원장(ledger) 조회 | 거래 기록을 수정 없이 append-only로 쌓고, 히스토리로 조회 |
 | 감사 로그 | 인증된 actor로 결제를 수행하면 actor가 정확히 기록되고, 미인증 컨텍스트에서는 `system`으로 폴백. 한도 초과·불법 상태 전이 같은 실패 시도도 `success=false`와 사유가 함께 기록됨을 검증 |
 | 레이트 리밋 | 고정 윈도우 카운터가 한도 도달 후 거부하고 윈도우 경과 후 리셋됨을 순수 유닛 테스트로, `RateLimitFilter`가 실제로 결제/로그인 경로에 걸려 429를 돌려주는지는 MockMvc로 각각 검증 |
 | HTTP 레이어 회귀 (MockMvc) | 서비스 계층 테스트로는 못 잡는 종류의 버그(예: `-parameters` 누락으로 인한 `@PathVariable` 400) 방지용, 실제 Spring MVC 디스패치로 승인→조회→감사로그 흐름을 검증 |
 | 멱등성 스냅샷 회귀 (MySQL Testcontainers) | 7번에서 고친 REPEATABLE READ 스냅샷 버그가 재발하지 않는지, 새 멱등성 키로 승인이 성공하는지 검증 |
 
-> **알려진 실패**: `PaymentServiceMySqlConcurrencyTest`의 4개 테스트 중 `mySqlShouldPreventConcurrentAuthorizationFromExceedingCreditLimit`와 `mySqlShouldSucceedOnFreshIdempotencyKey`(회귀 테스트)는 통과하지만, `mySqlShouldPreventConcurrentPartialRefundOverRefund`와 `mySqlShouldPreserveAllRestoresOnConcurrentCancels` 2건은 현재 15초 타임아웃으로 실패합니다.
-> **원인 진단**: 실제 동시성 버그가 아니라 테스트 설계 문제입니다. `@DataJpaTest`가 테스트 메서드 전체를 하나의 미커밋 트랜잭션으로 감싸는데, 이 두 테스트는 메인 스레드에서 사전 승인/매입을 먼저 실행합니다 — 그 트랜잭션이 아직 열려 있는 채로 백그라운드 스레드 2개를 띄우니, 백그라운드 스레드가 메인 스레드가 쥐고 있는(그리고 절대 커밋하지 않는) 행 락을 영원히 기다리게 됩니다.
-> **왜 지금 안 고쳤나**: 이 두 테스트가 검증하려는 실제 정합성 로직(부분환불 초과 방지, 취소 시 CardAccount 복원)은 코드 변경 없이 그대로 살아있고, 같은 락 메커니즘이 통과하는 한도초과 테스트로 이미 검증되고 있어 릴리즈를 막는 회귀는 아니라고 판단했습니다. 다만 이 두 테스트 자체는 지금 아무것도 증명하지 못하는 상태라, 테스트 인프라 개선 항목으로 분류하고 현재 범위 밖에 두었습니다. 해결 방향은 정해져 있습니다 — 설정 코드를 별도 커밋 트랜잭션으로 분리하거나, `@Transactional(propagation = NOT_SUPPORTED)`로 테스트 자체가 트랜잭션을 감싸지 않게 바꾸면 됩니다.
+> **해결된 실패 (2026-08-25)**: `PaymentServiceMySqlConcurrencyTest`의 `mySqlShouldPreventConcurrentPartialRefundOverRefund`와 `mySqlShouldPreserveAllRestoresOnConcurrentCancels` 2건이 15초 타임아웃으로 실패하던 문제를 수정했습니다.
+> **원인이었던 것**: 실제 동시성 버그가 아니라 테스트 설계 문제였습니다. `@DataJpaTest`가 테스트 메서드 전체를 하나의 미커밋 트랜잭션으로 감싸는데, 이 두 테스트는 메인 스레드에서 사전 승인/매입을 먼저 실행합니다 — 그 트랜잭션이 아직 열려 있는 채로 백그라운드 스레드 2개를 띄우니, 백그라운드 스레드가 메인 스레드가 쥐고 있는(그리고 절대 커밋하지 않는) 행 락을 영원히 기다리게 됩니다.
+> **수정**: 테스트 클래스에 `@Transactional(propagation = Propagation.NOT_SUPPORTED)`를 적용해 테스트 자체가 트랜잭션을 감싸지 않도록 바꾸고, 트랜잭션 시작 전에만 실행되던 `@BeforeTransaction` 셋업을 매 테스트 전에 실행되는 `@BeforeEach`로 교체했습니다. 이제 메인 스레드의 사전 호출도 실제로 커밋되어 락이 정상적으로 풀리고, 4개 테스트 모두 통과합니다(약 12초, 이전엔 실패 2건이 각 15초 타임아웃으로 소요).
 
 ---
 
@@ -309,7 +319,7 @@ Health 체크: `http://localhost:8080/actuator/health`
 .\mvnw.cmd test -Dtest=PaymentServiceMySqlConcurrencyTest
 ```
 
-`PaymentServiceMySqlConcurrencyTest`의 2건은 현재 실패 상태입니다 — 원인과 판단 근거는 [검증 (테스트)](#검증-테스트) 섹션 참고.
+`PaymentServiceMySqlConcurrencyTest`를 포함해 전체 27개 테스트가 통과합니다 — 이전에 실패했던 2건의 원인과 수정 내역은 [검증 (테스트)](#검증-테스트) 섹션 참고.
 
 ---
 

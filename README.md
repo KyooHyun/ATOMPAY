@@ -18,7 +18,7 @@
 | 인증 | Spring Security + JWT (HS256), Stateless 세션 |
 | 스키마 관리 | Flyway 버전 마이그레이션 (MySQL 프로파일) |
 | API 문서 | Swagger UI — `http://localhost:8080/swagger-ui.html` |
-| 검증 | JUnit 단위 테스트 33개(서비스 27 + 레이트리밋 4 + HTTP 레이어 2) + MySQL Testcontainers 동시성/회귀 테스트 5개 |
+| 검증 | JUnit 단위 테스트 41개(서비스 35 + 레이트리밋 4 + HTTP 레이어 2) + MySQL Testcontainers 동시성/회귀 테스트 5개 |
 | 운영 가시성 | MDC 기반 X-Request-Id 추적 · SLF4J 구조적 로깅 · Spring Actuator `/actuator/health` |
 | 의도적으로 제외 | 프론트엔드, PG 연동, 정산/대사, 회원 관리 |
 
@@ -104,6 +104,7 @@
 - **부분 매입(partial capture)**: 매입액이 승인액보다 적을 수 있습니다. 매입되지 않은 차액은 `CardAccount`로 즉시 복원되고, 한 번 매입된 승인은 다시 매입할 수 없습니다. 배경과 설계 판단은 "설계하며 내린 결정들" 11번 참고.
 - **부분환불이 잔액을 정확히 소진시키는 경계**: `partialRefund`는 남은 환불 가능액과 같거나 큰 금액을 명시적으로 거부합니다(`Authorization.partialRefund`). 잔액을 전부 비우는 요청은 `PARTIALLY_REFUNDED`가 아니라 `refund` 경로로 유도되어 `REFUNDED`로 귀결되게 했습니다 — "환불액이 매입액과 같아지면 그게 부분환불인가 전액환불인가"라는 애매함을 API 계약(엔드포인트 선택)으로 해소한 것입니다.
 - **0원 승인(카드 검증)**: 승인 금액 0은 카드 유효성만 확인하고 한도는 건드리지 않는 별도 도메인 케이스로 취급합니다(카드사가 계좌 검증·토큰화 시 실제로 쓰는 방식). `CardAccount.deductAvailableAmount`/`increaseAvailableAmount`는 여전히 양수만 받으므로, 서비스 레이어(`PaymentService`)에서 금액이 0이면 이 호출 자체를 건너뜁니다 — 카드 상태(`ACTIVE`/`BLOCKED`) 검증은 금액과 무관하게 항상 수행되므로 BLOCKED 카드는 0원 승인도 그대로 거부됩니다.
+- **감면 0원 승인(예: 국가유공자 감면)**: 위 검증용 0원 승인과 이름은 비슷하지만 다른 케이스입니다 — 검증 승인은 거래가 아니지만, 감면 0원은 실제 거래인데 청구액만 0입니다. `AuthorizationKind`(`STANDARD`/`VERIFICATION`/`DISCOUNTED_ZERO`)로 명시적으로 구분하고, 원장에 원금액·감면액·사유 코드를 보존합니다. 감면 자격 판정은 가맹점의 책임이고 결제 코어는 정합성만 검증합니다. 배경과 설계 판단은 "설계하며 내린 결정들" 12번 참고.
 
 ---
 
@@ -193,6 +194,18 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 - **동시성**: 매입 차액을 `CardAccount`에 복원하는 경로에도 락이 필요합니다. 취소/환불 복원 경로에서 락 누락을 뒤늦게 발견했던 것(4번)과 같은 종류의 실수를 반복하지 않도록, 처음부터 기존의 `findByCardIdForUpdate`(비관적 락) 경로를 그대로 재사용했습니다. 같은 레이스가 여기에도 있다는 걸 증명하기 위해 `mySqlShouldPreserveAllPartialCaptureReleasesOnConcurrentCaptures` 테스트를 추가해, 같은 카드의 서로 다른 두 승인을 동시에 부분 매입해도 두 복원분이 모두 반영됨을 MySQL Testcontainers로 검증했습니다.
 - **상태 머신 판단**: 부분 매입 후 별도 상태를 두지 않고 기존 `CAPTURED`를 그대로 씁니다. 잔여 승인액을 추가로 매입할 수 있게 할지도 검토했지만, 그러면 부분환불처럼 누적 매입액을 관리해야 해서 매입 횟수 관리라는 별개의 복잡도가 하나 더 생깁니다. 이 케이스로 증명하려는 건 매입 횟수 관리가 아니라 "매입되지 않은 차액이 정확히 한 번만 복원되는가"라는 차액 복원의 정합성이므로, 매입되지 않은 잔여분은 그 자리에서 소멸(즉시 한도 복원)시키고 한 번 매입된 승인은 다시 매입할 수 없게 하는 쪽으로 범위를 좁혔습니다.
 
+### 12. 감면 0원 승인(예: 국가유공자 감면) — 감면 "판정"이 아니라 "검증"
+
+**감면 자격 판정은 결제 코어의 책임이 아닙니다.** 누가 국가유공자이고 얼마를 감면받는지는 가맹점·정책 시스템이 결정할 일이지, 카드 결제 코어가 알 이유가 없습니다. 여기에 자격 판정 로직을 넣었다면 "이게 왜 결제 코어에 있죠?"라는 질문에 답을 못 했을 것이고, 그건 예외 케이스를 다룬 게 아니라 결제 코어와 가맹점 사이의 경계를 흐린 것이 됩니다.
+
+**그럼 결제 코어는 뭘 해야 하는가.** 가맹점을 신뢰하지 않는 것이 결제 코어의 기본 자세라는 관점에서, 가맹점이 보내온 감면 정보가 내적으로 일관되는지 검증하는 역할을 맡깁니다. 요청에 원금액(`originalAmount`)·감면액(`discountAmount`)·감면 사유 코드(`discountReasonCode`)가 함께 오면, `PaymentService.validateAndResolveKind`가 세 필드가 모두 있는지, `원금액 − 감면액 = 청구액`이 맞는지, 감면액이 원금액을 초과하지 않는지, 사유 코드가 `DiscountReasonCode`(현재 `NATIONAL_MERIT_RECIPIENT` 하나)에 정의된 값인지를 검사합니다. 자격 판정은 가맹점의 몫, 정합성 검증은 결제 코어의 몫입니다.
+
+**0원이 두 종류였다.** 이미 구현한 카드 검증용 0원 승인(11번 이전, `VERIFICATION`)과 감면으로 청구액이 0이 된 이번 케이스(`DISCOUNTED_ZERO`)는 금액만 같을 뿐 성격이 다릅니다. 검증 승인은 거래가 아니라 확인이라 원장에 남길 실적이 없지만, 감면 0원은 실제 거래이고 금액만 0일 뿐이라 원장에 남아야 합니다 — 유공자 이용 실적은 정산·감사 대상이기 때문입니다. 이 둘을 같은 코드로 처리하면 안 된다는 걸 명시적으로 드러내기 위해 `AuthorizationKind`(`STANDARD`/`VERIFICATION`/`DISCOUNTED_ZERO`) 필드를 두어 구분했고, `Authorization`·`payment_transaction` 양쪽에 원금액·감면액·사유 코드를 보존해 감면 0원 승인이 검증 0원 승인과 다르게 기록됨을 `verificationAndDiscountedZeroAuthorizationsShouldBeDistinguishableInTheLedger` 테스트로 검증했습니다.
+
+**환불에도 파장이 갔다.** 감면 거래를 환불하면 뭘 돌려주나요? 청구액이 0이니 돌려줄 돈은 없지만, 거래 자체는 취소돼야 하고 감면 실적도 되돌려야 합니다. `Authorization.refund(ZERO)`를 `kind == DISCOUNTED_ZERO`에서만 허용해 상태를 `REFUNDED`로 되돌리는 별도 경로를 추가했고(환불 금액이 없으니 `refundedAmount`는 그대로 둡니다), `CardAccount` 복원 호출은 금액이 0이면 건너뛰도록 가드를 추가했습니다. 검증용 0원 승인에는 이 경로를 열어주지 않아 `refund(0)`이 여전히 거부됨을 `verificationAuthorizationShouldRejectZeroAmountRefund`로 확인했습니다.
+
+**검증 과정에서 찾은 별개의 버그.** 이 기능이 실제 MySQL·Flyway 경로(`mysql` 프로파일)를 새 마이그레이션(`V4__add_discount_fields.sql`)과 함께 처음으로 정말 기동시켜보는 계기가 됐는데, `application-mysql.properties`에 `spring.datasource.driver-class-name`이 애초에 커밋된 적이 없어서 base `application.properties`의 H2 드라이버를 그대로 물려받아 기동 자체가 실패했습니다. 이전 세션 기록에는 이 버그를 고쳤다고 적혀 있었지만 실제로는 파일에 반영되지 않았던 것 — MySQL 프로파일이 Testcontainers 테스트(자체적으로 드라이버를 지정)로만 검증되고 `spring-boot:run`으로 직접 기동된 적은 없었기 때문에 이 괴리가 지금까지 드러나지 않았습니다. `spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver`를 추가하고, 로컬 MySQL 컨테이너에 대해 `spring-boot:run -Dspring-boot.run.profiles=mysql`로 기동 → Flyway 마이그레이션 → 실제 HTTP로 감면 0원 승인·매입·환불까지 직접 호출해 확인한 뒤 커밋했습니다.
+
 ---
 
 ## 검증 (테스트)
@@ -205,6 +218,7 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 | 카드 상태 검사 | BLOCKED 카드로 승인 시도 시 거부 |
 | 0원 승인(카드 검증) | 0원 승인은 한도를 차감하지 않고 성공하며, BLOCKED 카드는 금액이 0이어도 그대로 거부됨을 검증. 0원 승인의 capture(0)·cancel도 한도 필드를 건드리지 않고 정상 동작함을 검증 |
 | 부분 매입(partial capture) | 승인액보다 적은 매입 시 차액이 한도로 즉시 복원됨을 검증. 매입 이후 환불 한도는 원 승인액이 아니라 실제 매입액을 기준으로 계산됨(초과 환불 거부)을 검증. 승인액 초과 매입, 0원 매입(0원 승인이 아닌 경우), 재매입 시도는 각각 예외로 차단됨을 검증. 엔티티의 현재 상태(`amount`)는 매입액으로 갱신되지만 원 승인액은 원장·감사로그에 그대로 남아 있음을 검증. 동시에 서로 다른 두 승인을 부분 매입해도 두 복원분이 모두 반영되는지는 MySQL Testcontainers로 별도 검증 |
+| 감면 0원 승인(예: 국가유공자 감면) | 원금액−감면액=청구액 정합성, 감면액이 원금액을 초과하지 않는지, 세 필드가 함께 오는지, 사유 코드가 유효한지를 각각 위반 케이스로 검증. 검증용 0원 승인과 감면 0원 승인이 `kind`와 원장 기록 양쪽에서 서로 다르게 구분됨을 검증. 감면 0원 승인은 capture(0)·refund(0)로 한도를 건드리지 않고 정상 완결되지만, 검증용 0원 승인은 refund(0)이 거부됨을 검증 |
 | 원장(ledger) 조회 | 거래 기록을 수정 없이 append-only로 쌓고, 히스토리로 조회 |
 | 감사 로그 | 인증된 actor로 결제를 수행하면 actor가 정확히 기록되고, 미인증 컨텍스트에서는 `system`으로 폴백. 한도 초과·불법 상태 전이 같은 실패 시도도 `success=false`와 사유가 함께 기록됨을 검증 |
 | 레이트 리밋 | 고정 윈도우 카운터가 한도 도달 후 거부하고 윈도우 경과 후 리셋됨을 순수 유닛 테스트로, `RateLimitFilter`가 실제로 결제/로그인 경로에 걸려 429를 돌려주는지는 MockMvc로 각각 검증 |
@@ -334,7 +348,7 @@ Health 체크: `http://localhost:8080/actuator/health`
 .\mvnw.cmd test -Dtest=PaymentServiceMySqlConcurrencyTest
 ```
 
-`PaymentServiceMySqlConcurrencyTest`를 포함해 전체 38개 테스트가 통과합니다 — 이전에 실패했던 2건의 원인과 수정 내역은 [검증 (테스트)](#검증-테스트) 섹션 참고.
+`PaymentServiceMySqlConcurrencyTest`를 포함해 전체 46개 테스트가 통과합니다 — 이전에 실패했던 2건의 원인과 수정 내역은 [검증 (테스트)](#검증-테스트) 섹션 참고.
 
 ---
 

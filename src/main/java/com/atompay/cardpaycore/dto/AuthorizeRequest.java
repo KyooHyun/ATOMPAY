@@ -3,7 +3,7 @@ package com.atompay.cardpaycore.dto;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
-import jakarta.validation.constraints.Positive;
+import jakarta.validation.constraints.PositiveOrZero;
 
 import java.math.BigDecimal;
 
@@ -12,8 +12,13 @@ public class AuthorizeRequest {
     @NotBlank(message = "cardId is required")
     private String cardId;
 
+    /**
+     * Zero is a valid authorization amount — card networks use $0 authorizations
+     * to verify a card (status, existence) without placing a hold, e.g. for
+     * tokenization or account-verification flows. See {@link com.atompay.cardpaycore.service.PaymentService}.
+     */
     @NotNull(message = "amount is required")
-    @Positive(message = "amount must be positive")
+    @PositiveOrZero(message = "amount must not be negative")
     @DecimalMax(value = "999999.99", message = "amount exceeds the maximum transaction threshold")
     private BigDecimal amount;
 

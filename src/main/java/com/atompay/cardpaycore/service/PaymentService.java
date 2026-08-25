@@ -132,12 +132,14 @@ public class PaymentService {
                 throw new BadRequestException("Card account is not active.");
             }
 
-            if (cardAccount.getAvailableAmount().compareTo(request.getAmount()) < 0) {
-                throw new BadRequestException("Available credit limit is insufficient.");
+            boolean isVerificationAuth = request.getAmount().compareTo(BigDecimal.ZERO) == 0;
+            if (!isVerificationAuth) {
+                if (cardAccount.getAvailableAmount().compareTo(request.getAmount()) < 0) {
+                    throw new BadRequestException("Available credit limit is insufficient.");
+                }
+                cardAccount.deductAvailableAmount(request.getAmount());
+                cardAccountRepository.save(cardAccount);
             }
-
-            cardAccount.deductAvailableAmount(request.getAmount());
-            cardAccountRepository.save(cardAccount);
 
             String authorizationId = UUID.randomUUID().toString();
             Authorization authorization = new Authorization(
@@ -190,10 +192,12 @@ public class PaymentService {
             authorization.cancel();
             authorizationRepository.save(authorization);
 
-            CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
-                    .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
-            cardAccount.increaseAvailableAmount(authorization.getAmount());
-            cardAccountRepository.save(cardAccount);
+            if (authorization.getAmount().compareTo(BigDecimal.ZERO) > 0) {
+                CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
+                        .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
+                cardAccount.increaseAvailableAmount(authorization.getAmount());
+                cardAccountRepository.save(cardAccount);
+            }
             recordTransaction(authorization, TransactionType.CANCEL, authorization.getAmount());
             auditLogService.recordSuccess(TransactionType.CANCEL, authorizationId, authorization.getCardId(), authorization.getAmount());
 

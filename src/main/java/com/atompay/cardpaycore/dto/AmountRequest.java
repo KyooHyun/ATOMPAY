@@ -1,14 +1,18 @@
 package com.atompay.cardpaycore.dto;
 
 import jakarta.validation.constraints.NotNull;
-import jakarta.validation.constraints.Positive;
+import jakarta.validation.constraints.PositiveOrZero;
 
 import java.math.BigDecimal;
 
 public class AmountRequest {
 
+    /**
+     * Zero is only meaningful for capturing a $0 verification authorization;
+     * cancel/refund still reject it via Authorization's own domain rules.
+     */
     @NotNull(message = "amount is required")
-    @Positive(message = "amount must be positive")
+    @PositiveOrZero(message = "amount must not be negative")
     private BigDecimal amount;
 
     public AmountRequest() {

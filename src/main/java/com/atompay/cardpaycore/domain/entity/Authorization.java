@@ -88,8 +88,8 @@ public class Authorization {
     }
 
     public void capture(BigDecimal captureAmount) {
-        if (captureAmount == null || captureAmount.compareTo(BigDecimal.ZERO) <= 0) {
-            throw new IllegalArgumentException("Capture amount must be positive.");
+        if (captureAmount == null || captureAmount.compareTo(BigDecimal.ZERO) < 0) {
+            throw new IllegalArgumentException("Capture amount must not be negative.");
         }
         if (status != AuthorizationStatus.AUTHORIZED) {
             throw new IllegalStateException("Only authorized payments can be captured.");

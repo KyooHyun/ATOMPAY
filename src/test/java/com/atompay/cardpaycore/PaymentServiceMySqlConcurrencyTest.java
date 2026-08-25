@@ -14,14 +14,16 @@ import com.atompay.cardpaycore.config.JacksonConfig;
 import com.atompay.cardpaycore.service.AuditLogService;
 import com.atompay.cardpaycore.service.IdempotencyService;
 import com.atompay.cardpaycore.service.PaymentService;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.test.context.DynamicPropertyRegistry;
-import org.springframework.test.context.transaction.BeforeTransaction;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -40,6 +42,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DataJpaTest
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
 @Import({PaymentService.class, IdempotencyService.class, AuditLogService.class, JacksonConfig.class})
+@Transactional(propagation = Propagation.NOT_SUPPORTED)
 class PaymentServiceMySqlConcurrencyTest {
 
     @Container
@@ -73,7 +76,7 @@ class PaymentServiceMySqlConcurrencyTest {
     @Autowired
     private PaymentService paymentService;
 
-    @BeforeTransaction
+    @BeforeEach
     void setUp() {
         paymentTransactionRepository.deleteAllInBatch();
         idempotencyKeyRepository.deleteAllInBatch();

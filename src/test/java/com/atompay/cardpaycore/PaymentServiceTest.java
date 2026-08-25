@@ -127,6 +127,60 @@ class PaymentServiceTest {
         assertThrows(BadRequestException.class, () -> paymentService.authorize(request, "key-blocked"));
     }
 
+    // ── Zero-amount verification authorization ────────────────────────────────
+
+    @Test
+    void authorizeShouldAllowZeroAmountWithoutDeductingAvailableAmount() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.ZERO);
+
+        PaymentResponse response = paymentService.authorize(request, "key-zero-auth");
+
+        assertThat(response.getStatus()).isEqualTo("AUTHORIZED");
+        assertThat(response.getAmount()).isEqualByComparingTo(BigDecimal.ZERO);
+        assertThat(cardAccountRepository.findByCardId("CARD-001").get().getAvailableAmount())
+                .isEqualByComparingTo(BigDecimal.valueOf(5_000_000));
+    }
+
+    @Test
+    void authorizeShouldRejectZeroAmountOnBlockedCard() {
+        cardAccountRepository.deleteAll();
+        cardAccountRepository.save(new CardAccount("CARD-002", "4111-1111-1111-2222", BigDecimal.valueOf(5_000_000), BigDecimal.valueOf(5_000_000), CardAccountStatus.BLOCKED));
+
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-002");
+        request.setAmount(BigDecimal.ZERO);
+
+        assertThrows(BadRequestException.class, () -> paymentService.authorize(request, "key-zero-blocked"));
+    }
+
+    @Test
+    void captureShouldAllowZeroAmountOnZeroAmountAuthorization() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.ZERO);
+        PaymentResponse authorization = paymentService.authorize(request, "key-zero-auth");
+
+        PaymentResponse captureResponse = paymentService.capture(authorization.getAuthorizationId(), BigDecimal.ZERO, "key-zero-capture");
+
+        assertThat(captureResponse.getStatus()).isEqualTo("CAPTURED");
+    }
+
+    @Test
+    void cancelShouldNotTouchAvailableAmountForZeroAmountAuthorization() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.ZERO);
+        PaymentResponse authorization = paymentService.authorize(request, "key-zero-auth");
+
+        PaymentResponse cancelResponse = paymentService.cancel(authorization.getAuthorizationId(), "key-zero-cancel");
+
+        assertThat(cancelResponse.getStatus()).isEqualTo("CANCELLED");
+        assertThat(cardAccountRepository.findByCardId("CARD-001").get().getAvailableAmount())
+                .isEqualByComparingTo(BigDecimal.valueOf(5_000_000));
+    }
+
     // ── Capture ────────────────────────────────────────────────────────────────
 
     @Test

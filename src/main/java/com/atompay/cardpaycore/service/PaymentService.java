@@ -170,12 +170,19 @@ public class PaymentService {
             Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
                     .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
 
-            authorization.capture(amount);
+            BigDecimal releasedAmount = authorization.capture(amount);
             authorizationRepository.save(authorization);
+
+            if (releasedAmount.compareTo(BigDecimal.ZERO) > 0) {
+                CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
+                        .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
+                cardAccount.increaseAvailableAmount(releasedAmount);
+                cardAccountRepository.save(cardAccount);
+            }
             recordTransaction(authorization, TransactionType.CAPTURE, amount);
             auditLogService.recordSuccess(TransactionType.CAPTURE, authorizationId, authorization.getCardId(), amount);
 
-            log.info("Payment captured: authorizationId={}, amount={}", authorizationId, amount);
+            log.info("Payment captured: authorizationId={}, amount={}, releasedRemainder={}", authorizationId, amount, releasedAmount);
 
             return mapToResponse(authorization);
         } catch (RuntimeException ex) {

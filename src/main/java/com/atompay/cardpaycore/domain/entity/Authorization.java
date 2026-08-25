@@ -87,18 +87,32 @@ public class Authorization {
         return updatedAt;
     }
 
-    public void capture(BigDecimal captureAmount) {
+    /**
+     * Capturing less than the authorized amount (e.g. an order with a
+     * partially unavailable item, or a hotel/rental-car estimate settled at
+     * actual usage) releases the uncaptured remainder — this authorization
+     * cannot be captured again afterward. {@code amount} is updated to the
+     * captured amount so refund limits are bounded by what was actually
+     * captured, not the original hold.
+     */
+    public BigDecimal capture(BigDecimal captureAmount) {
         if (captureAmount == null || captureAmount.compareTo(BigDecimal.ZERO) < 0) {
             throw new IllegalArgumentException("Capture amount must not be negative.");
         }
         if (status != AuthorizationStatus.AUTHORIZED) {
             throw new IllegalStateException("Only authorized payments can be captured.");
         }
-        if (captureAmount.compareTo(amount) != 0) {
-            throw new IllegalArgumentException("Capture amount must equal the authorized amount.");
+        if (captureAmount.compareTo(amount) > 0) {
+            throw new IllegalArgumentException("Capture amount cannot exceed the authorized amount.");
         }
+        if (captureAmount.compareTo(BigDecimal.ZERO) == 0 && amount.compareTo(BigDecimal.ZERO) > 0) {
+            throw new IllegalArgumentException("Capture amount must be positive; use cancel to release a non-zero authorization.");
+        }
+        BigDecimal releasedAmount = amount.subtract(captureAmount);
+        this.amount = captureAmount;
         this.status = AuthorizationStatus.CAPTURED;
         this.updatedAt = OffsetDateTime.now();
+        return releasedAmount;
     }
 
     public void cancel() {

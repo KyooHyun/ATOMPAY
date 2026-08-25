@@ -199,6 +199,71 @@ class PaymentServiceTest {
         assertThat(paymentTransactionRepository.count()).isEqualTo(2);
     }
 
+    @Test
+    void captureShouldReleaseUncapturedRemainderToAvailableAmount() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(100_000));
+        PaymentResponse authorization = paymentService.authorize(request, "key-123");
+
+        PaymentResponse captureResponse = paymentService.capture(authorization.getAuthorizationId(), BigDecimal.valueOf(60_000), "key-capture-partial");
+
+        assertThat(captureResponse.getStatus()).isEqualTo("CAPTURED");
+        assertThat(captureResponse.getAmount()).isEqualByComparingTo(BigDecimal.valueOf(60_000));
+        // 5,000,000 - 100,000 authorized + 40,000 released remainder
+        assertThat(cardAccountRepository.findByCardId("CARD-001").get().getAvailableAmount())
+                .isEqualByComparingTo(BigDecimal.valueOf(4_940_000));
+    }
+
+    @Test
+    void partialCaptureShouldBoundSubsequentRefundsByCapturedAmountNotOriginalAuthorization() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(100_000));
+        PaymentResponse authorization = paymentService.authorize(request, "key-123");
+        paymentService.capture(authorization.getAuthorizationId(), BigDecimal.valueOf(60_000), "key-capture-partial");
+
+        assertThrows(IllegalArgumentException.class,
+                () -> paymentService.refund(authorization.getAuthorizationId(), BigDecimal.valueOf(70_000), "key-over-refund"));
+
+        PaymentResponse refundResponse = paymentService.refund(authorization.getAuthorizationId(), BigDecimal.valueOf(60_000), "key-full-refund");
+        assertThat(refundResponse.getStatus()).isEqualTo("REFUNDED");
+    }
+
+    @Test
+    void captureShouldRejectAmountExceedingAuthorizedAmount() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(100_000));
+        PaymentResponse authorization = paymentService.authorize(request, "key-123");
+
+        assertThrows(IllegalArgumentException.class,
+                () -> paymentService.capture(authorization.getAuthorizationId(), BigDecimal.valueOf(150_000), "key-over-capture"));
+    }
+
+    @Test
+    void captureShouldRejectZeroAmountOnNonZeroAuthorization() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(100_000));
+        PaymentResponse authorization = paymentService.authorize(request, "key-123");
+
+        assertThrows(IllegalArgumentException.class,
+                () -> paymentService.capture(authorization.getAuthorizationId(), BigDecimal.ZERO, "key-zero-capture"));
+    }
+
+    @Test
+    void captureShouldRejectSecondCaptureAfterPartialCapture() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(100_000));
+        PaymentResponse authorization = paymentService.authorize(request, "key-123");
+        paymentService.capture(authorization.getAuthorizationId(), BigDecimal.valueOf(60_000), "key-capture-1");
+
+        assertThrows(IllegalStateException.class,
+                () -> paymentService.capture(authorization.getAuthorizationId(), BigDecimal.valueOf(40_000), "key-capture-2"));
+    }
+
     // ── Cancel ─────────────────────────────────────────────────────────────────
 
     @Test

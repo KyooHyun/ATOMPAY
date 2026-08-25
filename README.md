@@ -18,7 +18,7 @@
 | 인증 | Spring Security + JWT (HS256), Stateless 세션 |
 | 스키마 관리 | Flyway 버전 마이그레이션 (MySQL 프로파일) |
 | API 문서 | Swagger UI — `http://localhost:8080/swagger-ui.html` |
-| 검증 | JUnit 단위 테스트 32개(서비스 26 + 레이트리밋 4 + HTTP 레이어 2) + MySQL Testcontainers 동시성/회귀 테스트 5개 |
+| 검증 | JUnit 단위 테스트 33개(서비스 27 + 레이트리밋 4 + HTTP 레이어 2) + MySQL Testcontainers 동시성/회귀 테스트 5개 |
 | 운영 가시성 | MDC 기반 X-Request-Id 추적 · SLF4J 구조적 로깅 · Spring Actuator `/actuator/health` |
 | 의도적으로 제외 | 프론트엔드, PG 연동, 정산/대사, 회원 관리 |
 
@@ -189,6 +189,7 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 실제 카드 결제에서는 승인액과 매입액이 다른 경우가 흔합니다. 주문 후 일부 품목이 품절돼 축소 매입되거나, 호텔·렌터카처럼 예상 금액으로 먼저 승인하고 실제 이용액으로 매입하는 경우입니다. 여기서 핵심은 "매입액이 승인액보다 작을 때 남는 차액을 어떻게 처리하느냐"입니다 — 취소도 환불도 아닌 제3의 경로가 필요합니다.
 
 - **불변식 재검증**: `capture액 = 승인액`을 `capture액 ≤ 승인액`으로 완화하면서, `Authorization.amount`를 실제 매입액으로 갱신하도록 바꿨습니다. 이렇게 해야 이후 환불 한도(`getRemainingRefundableAmount = amount - refundedAmount`)가 원래 승인액이 아니라 실제로 돈이 움직인 매입액을 기준으로 계산됩니다 — 승인액 기준으로 놔뒀다면 매입되지 않은 금액까지 환불 가능하다고 착각하는 버그가 생겼을 것입니다.
+  - `Authorization.amount`를 덮어쓰면 원 승인액이 사라지는 것 아니냐는 감사 관점의 우려가 있었습니다. 승인액과 매입액의 괴리(30,000원 승인 후 10,000원만 매입 등)는 이상거래 탐지에서 그 자체로 의미 있는 신호이기 때문입니다. 확인해보니 `payment_transaction`(원장)과 `audit_log`는 애초에 이벤트마다 새 행을 `save(new ...)`로 추가만 하는 append-only 구조라, capture 시점에 넘기는 `amount` 파라미터(엔티티 필드가 아니라 인자 값)를 그대로 기록합니다 — AUTHORIZATION 행은 원 승인액을, CAPTURE 행은 실제 매입액을 각각 영구히 보존하므로 엔티티의 현재 상태(`amount`)가 갱신되어도 이력은 그대로 남습니다. `partialCaptureShouldPreserveOriginalAuthorizedAmountInLedgerAndAuditLog` 테스트로 이를 명시적으로 검증했습니다. 별도 필드 분리는 불필요하다고 판단했습니다.
 - **동시성**: 매입 차액을 `CardAccount`에 복원하는 경로에도 락이 필요합니다. 취소/환불 복원 경로에서 락 누락을 뒤늦게 발견했던 것(4번)과 같은 종류의 실수를 반복하지 않도록, 처음부터 기존의 `findByCardIdForUpdate`(비관적 락) 경로를 그대로 재사용했습니다. 같은 레이스가 여기에도 있다는 걸 증명하기 위해 `mySqlShouldPreserveAllPartialCaptureReleasesOnConcurrentCaptures` 테스트를 추가해, 같은 카드의 서로 다른 두 승인을 동시에 부분 매입해도 두 복원분이 모두 반영됨을 MySQL Testcontainers로 검증했습니다.
 - **상태 머신 판단**: 부분 매입 후 별도 상태를 두지 않고 기존 `CAPTURED`를 그대로 씁니다. 잔여 승인액을 추가로 매입할 수 있게 할지도 고민했지만, 그러면 부분환불처럼 누적 매입액을 관리해야 해서 복잡도가 하나 더 생깁니다. 매입되지 않은 잔여분은 그 자리에서 소멸(즉시 한도 복원)시키고 한 번 매입된 승인은 다시 매입할 수 없게 해, 범위를 좁히는 쪽을 택했습니다.
 
@@ -203,7 +204,7 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 | 상태 전이 | 허용된 전이만 성공하고, capture 후 cancel 등 불법 전이 4종은 예외로 차단됨 |
 | 카드 상태 검사 | BLOCKED 카드로 승인 시도 시 거부 |
 | 0원 승인(카드 검증) | 0원 승인은 한도를 차감하지 않고 성공하며, BLOCKED 카드는 금액이 0이어도 그대로 거부됨을 검증. 0원 승인의 capture(0)·cancel도 한도 필드를 건드리지 않고 정상 동작함을 검증 |
-| 부분 매입(partial capture) | 승인액보다 적은 매입 시 차액이 한도로 즉시 복원됨을 검증. 매입 이후 환불 한도는 원 승인액이 아니라 실제 매입액을 기준으로 계산됨(초과 환불 거부)을 검증. 승인액 초과 매입, 0원 매입(0원 승인이 아닌 경우), 재매입 시도는 각각 예외로 차단됨을 검증. 동시에 서로 다른 두 승인을 부분 매입해도 두 복원분이 모두 반영되는지는 MySQL Testcontainers로 별도 검증 |
+| 부분 매입(partial capture) | 승인액보다 적은 매입 시 차액이 한도로 즉시 복원됨을 검증. 매입 이후 환불 한도는 원 승인액이 아니라 실제 매입액을 기준으로 계산됨(초과 환불 거부)을 검증. 승인액 초과 매입, 0원 매입(0원 승인이 아닌 경우), 재매입 시도는 각각 예외로 차단됨을 검증. 엔티티의 현재 상태(`amount`)는 매입액으로 갱신되지만 원 승인액은 원장·감사로그에 그대로 남아 있음을 검증. 동시에 서로 다른 두 승인을 부분 매입해도 두 복원분이 모두 반영되는지는 MySQL Testcontainers로 별도 검증 |
 | 원장(ledger) 조회 | 거래 기록을 수정 없이 append-only로 쌓고, 히스토리로 조회 |
 | 감사 로그 | 인증된 actor로 결제를 수행하면 actor가 정확히 기록되고, 미인증 컨텍스트에서는 `system`으로 폴백. 한도 초과·불법 상태 전이 같은 실패 시도도 `success=false`와 사유가 함께 기록됨을 검증 |
 | 레이트 리밋 | 고정 윈도우 카운터가 한도 도달 후 거부하고 윈도우 경과 후 리셋됨을 순수 유닛 테스트로, `RateLimitFilter`가 실제로 결제/로그인 경로에 걸려 429를 돌려주는지는 MockMvc로 각각 검증 |
@@ -333,7 +334,7 @@ Health 체크: `http://localhost:8080/actuator/health`
 .\mvnw.cmd test -Dtest=PaymentServiceMySqlConcurrencyTest
 ```
 
-`PaymentServiceMySqlConcurrencyTest`를 포함해 전체 37개 테스트가 통과합니다 — 이전에 실패했던 2건의 원인과 수정 내역은 [검증 (테스트)](#검증-테스트) 섹션 참고.
+`PaymentServiceMySqlConcurrencyTest`를 포함해 전체 38개 테스트가 통과합니다 — 이전에 실패했던 2건의 원인과 수정 내역은 [검증 (테스트)](#검증-테스트) 섹션 참고.
 
 ---
 

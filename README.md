@@ -87,7 +87,7 @@
 
 | 시작 상태 | 이벤트 | 결과 상태 | 비고 |
 |-----------|--------|-----------|------|
-| AUTHORIZED | capture | CAPTURED | 매입액 ≤ 승인액. 승인액보다 적게 매입하면(부분 매입) 차액은 한도로 즉시 복원되고, 이후 추가 매입은 불가 |
+| AUTHORIZED | capture | CAPTURED | 매입액 ≤ 승인액 (부분 매입 가능, 상세는 아래 참고) |
 | AUTHORIZED | cancel | CANCELLED | 매입 이전에만 가능 |
 | CAPTURED | partial refund | PARTIALLY_REFUNDED | 매입 후 일부 환불 |
 | PARTIALLY_REFUNDED | partial refund | PARTIALLY_REFUNDED | 누적 환불 금액 관리 |
@@ -101,7 +101,7 @@
 - 환불은 `Authorization.refundedAmount`를 누적 관리하며, 누적 환불액이 매입액을 초과할 수 없습니다.
 - 금액은 부동소수점 오차를 피하기 위해 `BigDecimal` 기반으로 다루고, `capture액 ≤ 승인액`, `누적 환불 ≤ 매입액` 불변식을 엔티티에서 강제합니다.
 - 불법 전이(예: `CAPTURED`에서 `cancel`)는 예외를 던져 차단합니다.
-- **부분 매입(partial capture)**: 매입액이 승인액보다 적을 수 있습니다(주문 일부 품절, 호텔/렌터카처럼 예상 금액으로 승인 후 실사용액으로 매입하는 경우). 매입 시점에 `Authorization.amount`를 실제 매입액으로 갱신해, 이후 환불 한도(`getRemainingRefundableAmount`)가 원래 승인액이 아니라 실제 매입액을 기준으로 계산되게 했습니다. 매입되지 않은 차액은 그 자리에서 `CardAccount`로 즉시 복원되며, 한 번 매입된 승인은 다시 매입할 수 없습니다(잔여 승인액은 소멸 — 실제 매입액만큼만 상태를 이어가는 단순한 모델을 택했고, 잔여분 추가 매입까지 허용하면 환불 누적액과 같은 구조의 복잡도가 하나 더 생겨 범위를 좁혔습니다).
+- **부분 매입(partial capture)**: 매입액이 승인액보다 적을 수 있습니다. 매입되지 않은 차액은 `CardAccount`로 즉시 복원되고, 한 번 매입된 승인은 다시 매입할 수 없습니다. 배경과 설계 판단은 "설계하며 내린 결정들" 11번 참고.
 - **부분환불이 잔액을 정확히 소진시키는 경계**: `partialRefund`는 남은 환불 가능액과 같거나 큰 금액을 명시적으로 거부합니다(`Authorization.partialRefund`). 잔액을 전부 비우는 요청은 `PARTIALLY_REFUNDED`가 아니라 `refund` 경로로 유도되어 `REFUNDED`로 귀결되게 했습니다 — "환불액이 매입액과 같아지면 그게 부분환불인가 전액환불인가"라는 애매함을 API 계약(엔드포인트 선택)으로 해소한 것입니다.
 - **0원 승인(카드 검증)**: 승인 금액 0은 카드 유효성만 확인하고 한도는 건드리지 않는 별도 도메인 케이스로 취급합니다(카드사가 계좌 검증·토큰화 시 실제로 쓰는 방식). `CardAccount.deductAvailableAmount`/`increaseAvailableAmount`는 여전히 양수만 받으므로, 서비스 레이어(`PaymentService`)에서 금액이 0이면 이 호출 자체를 건너뜁니다 — 카드 상태(`ACTIVE`/`BLOCKED`) 검증은 금액과 무관하게 항상 수행되므로 BLOCKED 카드는 0원 승인도 그대로 거부됩니다.
 
@@ -191,7 +191,7 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 - **불변식 재검증**: `capture액 = 승인액`을 `capture액 ≤ 승인액`으로 완화하면서, `Authorization.amount`를 실제 매입액으로 갱신하도록 바꿨습니다. 이렇게 해야 이후 환불 한도(`getRemainingRefundableAmount = amount - refundedAmount`)가 원래 승인액이 아니라 실제로 돈이 움직인 매입액을 기준으로 계산됩니다 — 승인액 기준으로 놔뒀다면 매입되지 않은 금액까지 환불 가능하다고 착각하는 버그가 생겼을 것입니다.
   - `Authorization.amount`를 덮어쓰면 원 승인액이 사라지는 것 아니냐는 감사 관점의 우려가 있었습니다. 승인액과 매입액의 괴리(30,000원 승인 후 10,000원만 매입 등)는 이상거래 탐지에서 그 자체로 의미 있는 신호이기 때문입니다. 확인해보니 `payment_transaction`(원장)과 `audit_log`는 애초에 이벤트마다 새 행을 `save(new ...)`로 추가만 하는 append-only 구조라, capture 시점에 넘기는 `amount` 파라미터(엔티티 필드가 아니라 인자 값)를 그대로 기록합니다 — AUTHORIZATION 행은 원 승인액을, CAPTURE 행은 실제 매입액을 각각 영구히 보존하므로 엔티티의 현재 상태(`amount`)가 갱신되어도 이력은 그대로 남습니다. `partialCaptureShouldPreserveOriginalAuthorizedAmountInLedgerAndAuditLog` 테스트로 이를 명시적으로 검증했습니다. 별도 필드 분리는 불필요하다고 판단했습니다.
 - **동시성**: 매입 차액을 `CardAccount`에 복원하는 경로에도 락이 필요합니다. 취소/환불 복원 경로에서 락 누락을 뒤늦게 발견했던 것(4번)과 같은 종류의 실수를 반복하지 않도록, 처음부터 기존의 `findByCardIdForUpdate`(비관적 락) 경로를 그대로 재사용했습니다. 같은 레이스가 여기에도 있다는 걸 증명하기 위해 `mySqlShouldPreserveAllPartialCaptureReleasesOnConcurrentCaptures` 테스트를 추가해, 같은 카드의 서로 다른 두 승인을 동시에 부분 매입해도 두 복원분이 모두 반영됨을 MySQL Testcontainers로 검증했습니다.
-- **상태 머신 판단**: 부분 매입 후 별도 상태를 두지 않고 기존 `CAPTURED`를 그대로 씁니다. 잔여 승인액을 추가로 매입할 수 있게 할지도 고민했지만, 그러면 부분환불처럼 누적 매입액을 관리해야 해서 복잡도가 하나 더 생깁니다. 매입되지 않은 잔여분은 그 자리에서 소멸(즉시 한도 복원)시키고 한 번 매입된 승인은 다시 매입할 수 없게 해, 범위를 좁히는 쪽을 택했습니다.
+- **상태 머신 판단**: 부분 매입 후 별도 상태를 두지 않고 기존 `CAPTURED`를 그대로 씁니다. 잔여 승인액을 추가로 매입할 수 있게 할지도 검토했지만, 그러면 부분환불처럼 누적 매입액을 관리해야 해서 매입 횟수 관리라는 별개의 복잡도가 하나 더 생깁니다. 이 케이스로 증명하려는 건 매입 횟수 관리가 아니라 "매입되지 않은 차액이 정확히 한 번만 복원되는가"라는 차액 복원의 정합성이므로, 매입되지 않은 잔여분은 그 자리에서 소멸(즉시 한도 복원)시키고 한 번 매입된 승인은 다시 매입할 수 없게 하는 쪽으로 범위를 좁혔습니다.
 
 ---
 
@@ -213,7 +213,7 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 
 > **해결된 실패 (2026-08-25)**: `PaymentServiceMySqlConcurrencyTest`의 `mySqlShouldPreventConcurrentPartialRefundOverRefund`와 `mySqlShouldPreserveAllRestoresOnConcurrentCancels` 2건이 15초 타임아웃으로 실패하던 문제를 수정했습니다.
 > **원인이었던 것**: 실제 동시성 버그가 아니라 테스트 설계 문제였습니다. `@DataJpaTest`가 테스트 메서드 전체를 하나의 미커밋 트랜잭션으로 감싸는데, 이 두 테스트는 메인 스레드에서 사전 승인/매입을 먼저 실행합니다 — 그 트랜잭션이 아직 열려 있는 채로 백그라운드 스레드 2개를 띄우니, 백그라운드 스레드가 메인 스레드가 쥐고 있는(그리고 절대 커밋하지 않는) 행 락을 영원히 기다리게 됩니다.
-> **수정**: 테스트 클래스에 `@Transactional(propagation = Propagation.NOT_SUPPORTED)`를 적용해 테스트 자체가 트랜잭션을 감싸지 않도록 바꾸고, 트랜잭션 시작 전에만 실행되던 `@BeforeTransaction` 셋업을 매 테스트 전에 실행되는 `@BeforeEach`로 교체했습니다. 이제 메인 스레드의 사전 호출도 실제로 커밋되어 락이 정상적으로 풀리고, 4개 테스트 모두 통과합니다(약 12초, 이전엔 실패 2건이 각 15초 타임아웃으로 소요).
+> **수정**: 테스트 클래스에 `@Transactional(propagation = Propagation.NOT_SUPPORTED)`를 적용해 테스트 자체가 트랜잭션을 감싸지 않도록 바꾸고, 트랜잭션 시작 전에만 실행되던 `@BeforeTransaction` 셋업을 매 테스트 전에 실행되는 `@BeforeEach`로 교체했습니다. 이제 메인 스레드의 사전 호출도 실제로 커밋되어 락이 정상적으로 풀리고, 이 클래스의 테스트(현재 5개 — 11번에서 추가한 부분 매입 동시성 테스트 포함) 모두 통과합니다(10초대, 이전엔 실패 2건이 각 15초 타임아웃으로 소요).
 
 ---
 

@@ -18,7 +18,8 @@
 | 인증 | Spring Security + JWT (HS256), Stateless 세션 |
 | 스키마 관리 | Flyway 버전 마이그레이션 (MySQL 프로파일) |
 | API 문서 | Swagger UI — `http://localhost:8080/swagger-ui.html` |
-| 검증 | JUnit 단위 테스트 41개(서비스 35 + 레이트리밋 4 + HTTP 레이어 2) + MySQL Testcontainers 동시성/회귀 테스트 5개 |
+| 검증 | JUnit 단위 테스트 45개(서비스 38 + 레이트리밋 4 + HTTP 레이어 3) + MySQL Testcontainers 동시성/회귀 테스트 8개 + 운영 프로파일 HTTP 스모크 테스트 |
+| 배포 · CI | Dockerfile + Docker Compose(MySQL), GitHub Actions에서 전체 테스트 + 운영 프로파일 기동 스모크 테스트를 매 push마다 실행 |
 | 운영 가시성 | MDC 기반 X-Request-Id 추적 · SLF4J 구조적 로깅 · Spring Actuator `/actuator/health` |
 | 의도적으로 제외 | 프론트엔드, PG 연동, 정산/대사, 회원 관리 |
 
@@ -67,7 +68,7 @@
 | CSRF | REST API 특성상 비활성화 |
 | 공개 엔드포인트 | `/api/v1/auth/**`, `/swagger-ui/**`, `/actuator/health` |
 | 보호 엔드포인트 | 그 외 모든 API |
-| 시크릿 관리 | `JWT_SECRET` 환경변수로 주입, 미설정 시 개발용 기본값 폴백 |
+| 시크릿 관리 | `JWT_SECRET` 환경변수로 주입. 개발(H2) 프로파일만 개발용 기본값으로 폴백하고, 운영(`mysql`) 프로파일은 미설정 시 **기동 자체를 실패**시킴 — 공개 저장소에 있는 기본 키로 서명된 토큰이 운영에서 통과하는 일을 막기 위해 |
 | 레이트 리밋 | 결제 API(`/api/v1/payments/**`)는 actor(인증된 username, 미인증 요청은 `anonymous` 버킷)당 10초에 30건, 로그인(`/api/v1/auth/login`)은 remote IP당 분당 10건으로 제한, 초과 시 429 + `Retry-After` |
 | 감사 로그 | 승인/매입/취소/환불의 성공·실패를 모두 actor·시각·금액과 함께 기록 (`GET .../audit-log`), 실패 기록은 `REQUIRES_NEW`로 별도 커밋 |
 
@@ -130,6 +131,7 @@
 단순히 "키가 있으면 스킵, 없으면 처리"는 **TOCTOU** 취약점이 있습니다.
 `idempotency_key`에 DB unique 제약을 걸어 동시 도착 시 두 번째 요청이 제약 위반으로 걸러지게 하고,
 완료된 요청의 응답 페이로드를 함께 저장해 재시도 시 재처리 없이 동일 응답을 반환하도록 했습니다.
+(이 설계에는 "키가 영구히 잠기는" 구멍이 남아 있었고, 13번에서 재설계했습니다.)
 
 ### 4. CardAccount 복원 경로의 락 누락 — 발견하고 수정
 
@@ -206,6 +208,41 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 
 **검증 과정에서 찾은 별개의 버그.** 이 기능이 실제 MySQL·Flyway 경로(`mysql` 프로파일)를 새 마이그레이션(`V4__add_discount_fields.sql`)과 함께 처음으로 정말 기동시켜보는 계기가 됐는데, `application-mysql.properties`에 `spring.datasource.driver-class-name`이 애초에 커밋된 적이 없어서 base `application.properties`의 H2 드라이버를 그대로 물려받아 기동 자체가 실패했습니다. 이전 세션 기록에는 이 버그를 고쳤다고 적혀 있었지만 실제로는 파일에 반영되지 않았던 것 — MySQL 프로파일이 Testcontainers 테스트(자체적으로 드라이버를 지정)로만 검증되고 `spring-boot:run`으로 직접 기동된 적은 없었기 때문에 이 괴리가 지금까지 드러나지 않았습니다. `spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver`를 추가하고, 로컬 MySQL 컨테이너에 대해 `spring-boot:run -Dspring-boot.run.profiles=mysql`로 기동 → Flyway 마이그레이션 → 실제 HTTP로 감면 0원 승인·매입·환불까지 직접 호출해 확인한 뒤 커밋했습니다.
 
+### 13. 멱등성 키가 영구히 잠기는 구멍 — "정리 코드"가 아니라 "락"으로 소유권을 표현
+
+**구멍.** 3번·7번의 구조는 placeholder를 `REQUIRES_NEW`로 먼저 커밋해 두고, 연산이 실패하면 `catch` 블록에서 지우는 방식이었습니다. 그런데 `catch`가 잡을 수 있는 건 *연산 중* 실패뿐입니다. 연산이 끝난 뒤 **바깥 트랜잭션의 커밋 자체가 실패**하거나(데드락 희생자 선정, 커넥션 끊김) 처리 도중 **프로세스가 죽으면**, 결제 데이터는 롤백되는데 이미 커밋된 빈 placeholder는 그대로 남습니다. 이후 그 키로 오는 재시도는 전부 "already being processed"(400)를 받습니다 — 일시적인 것도 아니고 영원히. 클라이언트 입장에선 결제가 된 건지 안 된 건지 확인할 방법도, 다시 시도할 방법도 없어지는 상태입니다.
+
+**재현 먼저.** 커밋 실패는 "`authorize()`가 정상 반환된 직후 바깥 트랜잭션을 롤백"으로 정확히 모델링됩니다(예외가 연산 밖에서 나므로 `catch`를 타지 않음). 이 테스트(`mySqlShouldAllowRetryAfterOuterTransactionRollsBackPastTheOperation`)는 수정 전 코드에서 재시도가 400으로 실패했습니다.
+
+**재현하다 찾은 두 번째 버그.** 같은 키 동시 중복 요청 테스트를 수정 전 코드에 돌려보니, 패자가 400도 아니라 **500**(`UnexpectedRollbackException`)을 받았습니다. `tryReservePlaceholder`가 `REQUIRES_NEW` 트랜잭션 *안에서* 제약 위반 예외를 잡고 `false`를 반환했는데, 그 시점엔 리포지토리 프록시가 이미 트랜잭션을 rollback-only로 표시해 둬서 커밋 단계에서 터진 것입니다. 즉 "동시 요청이면 false 반환" 경로는 처음부터 한 번도 동작한 적이 없었습니다. 예외를 트랜잭션 경계 **밖**(호출자)에서 잡도록 고쳤습니다.
+
+**재설계: 행 락이 곧 "처리 중"이라는 신호.** 정리 코드를 더 꼼꼼히 짜는 대신, 정리가 필요 없는 구조로 바꿨습니다.
+
+1. 완료된(`COMPLETED`) 키면 캐시된 응답을 replay
+2. 행이 없으면 `IN_PROGRESS` placeholder를 `REQUIRES_NEW`로 커밋 (동시 요청에 지면 그냥 넘어감 — 어차피 행은 있음)
+3. **바깥 트랜잭션에서 그 행을 `SELECT ... FOR UPDATE`로 잠금** — 다른 요청이 소유 중이면 그 트랜잭션이 끝날 때까지 대기
+4. 락을 얻은 뒤 `COMPLETED`면 동시 중복 요청이 먼저 끝난 것 → replay. `IN_PROGRESS`면 아무도 완료하지 못한 것 — 방금 내가 만들었거나, 이전 소유자의 트랜잭션이 롤백됐다는 뜻이고, 롤백됐다면 그 시도의 결제 효과도 함께 사라졌으므로 **넘겨받아 실행해도 안전**
+5. 연산 결과와 `COMPLETED` 표시를 같은 트랜잭션에서 커밋 — 결제와 캐시된 응답은 함께 커밋되거나 함께 롤백
+
+"처리 중인가"를 상태 컬럼이나 타임아웃으로 판단하지 않고 **DB가 관리하는 락의 생존 여부**로 판단하므로, 소유자가 커밋에 실패하든 죽든 DB가 트랜잭션을 정리하는 순간 키는 자동으로 회수 가능해집니다. 타임아웃 기반(예: "30초 지난 IN_PROGRESS는 회수")은 처리가 30초를 넘기면 **이중 결제**를 낼 수 있어 택하지 않았습니다. 실패 시 placeholder를 지우는 코드도 아예 없앴는데, 이 구조에서 `REQUIRES_NEW`로 지우려 하면 자기 바깥 트랜잭션이 쥔 락을 기다리는 자기 데드락이 되기 때문입니다.
+
+**트레이드오프.** 동시 중복 요청은 이제 즉시 거절되지 않고 원 요청이 끝날 때까지 대기합니다(최대 InnoDB `innodb_lock_wait_timeout`). 대신 결과가 "잠시 후 재시도하라"는 에러가 아니라 원 요청의 응답 그대로라, 클라이언트 재시도 로직이 단순해집니다.
+
+**같이 고친 것.**
+- **키를 호출자 단위로 스코프** — 키는 클라이언트가 만드는 값이라 서로 다른 호출자가 같은 키를 고를 수 있습니다. 전역 unique였을 땐 B가 A와 같은 키·같은 본문을 보내면 A의 응답(승인 정보)을 그대로 받았습니다. Stripe가 계정 단위로 키를 구분하듯 `(actor, key_value)` unique로 바꿨습니다(`V5` 마이그레이션 — 기존의 빈 placeholder는 `IN_PROGRESS`로 변환돼 이번 배포와 함께 회수 가능해짐. V4 상태의 DB에 데이터를 넣고 V5를 적용해 확인).
+- **`100` vs `100.00`** — 요청 해시가 `BigDecimal.toString()`이라 같은 금액을 다르게 직렬화한 재시도가 "다른 요청"으로 거부됐습니다. 값 기준(`stripTrailingZeros().toPlainString()`)으로 정규화.
+- **HTTP 의미** — 같은 키를 다른 본문에 재사용하면 422(IETF Idempotency-Key 초안 권고), 컬럼 길이(64자)를 넘는 키는 insert 시 500이 아니라 400으로 사전 차단.
+- **capture vs cancel 경합 테스트** — 둘 다 `AUTHORIZED`에서 출발하는 상호 배타적 전이라 경합 시 정확히 하나만 이겨야 합니다. 기존 `Authorization` 락으로 이미 안전했고(수정 전 코드에서도 통과), 이를 증명하는 테스트로 추가했습니다.
+
+### 14. 운영 프로파일을 CI에서 매번 실제로 띄운다
+
+`mysql` 프로파일은 지금까지 두 번(드라이버 누락 — 7번·12번) 깨진 채로 아무 테스트에도 걸리지 않았습니다. MySQL을 쓰는 유일한 테스트인 Testcontainers가 자체 datasource 설정을 주입해서 이 파일을 전혀 읽지 않기 때문입니다. 사람이 기억해서 수동으로 띄워보는 방식으로는 같은 일이 또 생긴다고 보고, **구조적으로** 막았습니다.
+
+- `Dockerfile`(멀티 스테이지, non-root 실행) + `docker-compose.yml`(MySQL 포함)로 운영 프로파일을 한 줄로 기동
+- GitHub Actions에서 매 push마다 ① `mvn clean verify`(Testcontainers 포함 전체 테스트) ② compose로 운영 프로파일을 띄워 `scripts/smoke-test.sh`가 실제 HTTP로 라이프사이클 전체와 멱등성 계약을 검증
+- 이걸 만들다 발견한 것: Spring Boot parent POM 없이 BOM만 import하는 구조라 `repackage` goal이 바인딩돼 있지 않아 `mvn package` 결과물이 **실행 불가능한 jar**였습니다(지금까지 `spring-boot:run`으로만 띄워서 드러나지 않음). goal을 명시적으로 바인딩.
+- 운영 프로파일은 DB 접속 정보를 환경변수로 받고, `JWT_SECRET`에 **기본값을 두지 않아** 미설정 시 기동이 실패합니다. 개발용 기본 키는 공개 저장소에 있으므로, 운영에서 그 키로 폴백하면 누구나 유효한 토큰을 위조할 수 있습니다.
+
 ---
 
 ## 검증 (테스트)
@@ -213,7 +250,9 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 | 테스트 | 검증 내용 |
 |--------|-----------|
 | 동시성 재현 (MySQL Testcontainers) | 락 제거 시 동시 요청으로 한도/환불 금액이 깨지는 것을 재현하고, 락 적용 시 최종 금액이 정확함을 검증 |
-| 멱등성 재시도 | 같은 키 재시도 시 중복 처리 없이 동일 응답 반환, 다른 본문 동일 키는 거부 |
+| 멱등성 재시도 | 같은 키 재시도 시 중복 처리 없이 동일 응답 반환, 다른 본문 동일 키는 거부(HTTP 422). `100`과 `100.00`처럼 표현만 다른 같은 금액의 재시도는 replay됨. 같은 키라도 actor가 다르면 서로의 응답을 공유하지 않음. 64자 초과 키는 400 |
+| 멱등성 키 영구 잠김 회귀 (MySQL Testcontainers) | 13번에서 고친 버그 — 바깥 트랜잭션이 연산 반환 **이후** 롤백(커밋 실패 모델링)돼도 같은 키 재시도가 성공하고, 첫 시도의 효과는 남지 않아 한도가 한 번만 차감됨을 검증. 같은 키 동시 중복 요청 2건은 둘 다 성공하고 같은 `authorizationId`를 받으며 실제 승인은 1건임을 검증 |
+| capture vs cancel 경합 (MySQL Testcontainers) | 같은 승인에 매입과 취소가 동시에 들어오면 정확히 하나만 성공하고, 카드 한도·최종 상태·원장이 이긴 쪽과 일치함을 검증 |
 | 상태 전이 | 허용된 전이만 성공하고, capture 후 cancel 등 불법 전이 4종은 예외로 차단됨 |
 | 카드 상태 검사 | BLOCKED 카드로 승인 시도 시 거부 |
 | 0원 승인(카드 검증) | 0원 승인은 한도를 차감하지 않고 성공하며, BLOCKED 카드는 금액이 0이어도 그대로 거부됨을 검증. 0원 승인의 capture(0)·cancel도 한도 필드를 건드리지 않고 정상 동작함을 검증 |
@@ -224,10 +263,13 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 | 레이트 리밋 | 고정 윈도우 카운터가 한도 도달 후 거부하고 윈도우 경과 후 리셋됨을 순수 유닛 테스트로, `RateLimitFilter`가 실제로 결제/로그인 경로에 걸려 429를 돌려주는지는 MockMvc로 각각 검증 |
 | HTTP 레이어 회귀 (MockMvc) | 서비스 계층 테스트로는 못 잡는 종류의 버그(예: `-parameters` 누락으로 인한 `@PathVariable` 400) 방지용, 실제 Spring MVC 디스패치로 승인→조회→감사로그 흐름을 검증 |
 | 멱등성 스냅샷 회귀 (MySQL Testcontainers) | 7번에서 고친 REPEATABLE READ 스냅샷 버그가 재발하지 않는지, 새 멱등성 키로 승인이 성공하는지 검증 |
+| 운영 프로파일 스모크 (`scripts/smoke-test.sh`, CI) | Docker Compose로 `mysql` 프로파일(Flyway + `ddl-auto=validate`)을 실제 기동한 뒤, 로그인 → 승인 → 같은 키 재시도(`10000.00`) replay → 다른 본문 422 → 부분 매입 → 부분환불 → 환불 → 원장 순서를 실제 HTTP로 검증 |
+
+> **회귀 테스트 검증 방식**: 13번의 회귀 테스트들은 "통과한다"가 아니라 "수정을 되돌리면 실패한다"로 확인했습니다 — 금액 정규화를 `toString()`으로, actor 스코프를 고정값으로, 잠금 조회를 일반 조회로 각각 되돌려 해당 테스트가 실패하는 것을 확인한 뒤 원복했습니다. 수정 전 코드에서도 두 MySQL 회귀 테스트가 각각 400("already being processed")과 500(`UnexpectedRollbackException`)으로 실패하는 것을 먼저 확인했습니다.
 
 > **해결된 실패 (2026-08-25)**: `PaymentServiceMySqlConcurrencyTest`의 `mySqlShouldPreventConcurrentPartialRefundOverRefund`와 `mySqlShouldPreserveAllRestoresOnConcurrentCancels` 2건이 15초 타임아웃으로 실패하던 문제를 수정했습니다.
 > **원인이었던 것**: 실제 동시성 버그가 아니라 테스트 설계 문제였습니다. `@DataJpaTest`가 테스트 메서드 전체를 하나의 미커밋 트랜잭션으로 감싸는데, 이 두 테스트는 메인 스레드에서 사전 승인/매입을 먼저 실행합니다 — 그 트랜잭션이 아직 열려 있는 채로 백그라운드 스레드 2개를 띄우니, 백그라운드 스레드가 메인 스레드가 쥐고 있는(그리고 절대 커밋하지 않는) 행 락을 영원히 기다리게 됩니다.
-> **수정**: 테스트 클래스에 `@Transactional(propagation = Propagation.NOT_SUPPORTED)`를 적용해 테스트 자체가 트랜잭션을 감싸지 않도록 바꾸고, 트랜잭션 시작 전에만 실행되던 `@BeforeTransaction` 셋업을 매 테스트 전에 실행되는 `@BeforeEach`로 교체했습니다. 이제 메인 스레드의 사전 호출도 실제로 커밋되어 락이 정상적으로 풀리고, 이 클래스의 테스트(현재 5개 — 11번에서 추가한 부분 매입 동시성 테스트 포함) 모두 통과합니다(10초대, 이전엔 실패 2건이 각 15초 타임아웃으로 소요).
+> **수정**: 테스트 클래스에 `@Transactional(propagation = Propagation.NOT_SUPPORTED)`를 적용해 테스트 자체가 트랜잭션을 감싸지 않도록 바꾸고, 트랜잭션 시작 전에만 실행되던 `@BeforeTransaction` 셋업을 매 테스트 전에 실행되는 `@BeforeEach`로 교체했습니다. 이제 메인 스레드의 사전 호출도 실제로 커밋되어 락이 정상적으로 풀리고, 이 클래스의 테스트(현재 8개 — 11번의 부분 매입 동시성 테스트, 13번의 멱등성·capture/cancel 경합 테스트 포함) 모두 통과합니다(10초대, 이전엔 실패 2건이 각 15초 타임아웃으로 소요).
 
 ---
 
@@ -270,7 +312,7 @@ H2와 MySQL Testcontainers 테스트 어느 쪽도 이 경로를 실제로 검�
 | GET | `/api/v1/payments/{authorizationId}/transactions` | 거래 히스토리 조회 |
 | GET | `/api/v1/payments/{authorizationId}/audit-log` | 감사 로그 조회 (누가·언제·무엇을) |
 
-- 모든 상태 변경 요청에는 `Idempotency-Key` 헤더가 필요합니다.
+- 모든 상태 변경 요청에는 `Idempotency-Key` 헤더(최대 64자)가 필요합니다. 키는 호출자(actor) 단위로 구분되며, 같은 키를 다른 요청 본문에 재사용하면 `422 Unprocessable Entity`를 반환합니다.
 - 외부 식별자(`authorizationId`)는 UUID를 사용해 IDOR를 방지합니다.
 - `/api/v1/payments/**`는 actor당 10초에 30건, `/api/v1/auth/login`은 remote IP당 분당 10건으로 레이트 리밋됩니다 (초과 시 429).
 - 요청마다 `X-Request-Id` 헤더를 응답으로 반환합니다.
@@ -324,9 +366,20 @@ Health 체크: `http://localhost:8080/actuator/health`
 3. 우상단 **Authorize** 버튼 클릭 후 토큰 입력
 4. 결제 API 테스트
 
-### MySQL (Flyway 활성화)
+### Docker Compose (운영 프로파일: MySQL + Flyway + `ddl-auto=validate`)
 
-`src/main/resources/application-mysql.properties`에 연결 정보를 설정한 뒤 실행합니다.
+```bash
+JWT_SECRET=$(openssl rand -base64 32) docker compose up --build
+
+# 다른 터미널에서 전체 라이프사이클 스모크 테스트 (curl, jq 필요)
+bash scripts/smoke-test.sh
+```
+
+`JWT_SECRET`을 지정하지 않으면 compose가 실행을 거부합니다(운영 프로파일은 개발용 기본 키로 기동하지 않음).
+
+### MySQL 직접 연결 (Flyway 활성화)
+
+연결 정보는 환경변수 `DB_URL` / `DB_USERNAME` / `DB_PASSWORD`로 주입하고(미지정 시 `localhost:3306/cardpay`, `root`), `JWT_SECRET`은 필수입니다.
 
 ```bash
 .\mvnw.cmd spring-boot:run -Dspring-boot.run.profiles=mysql
@@ -348,7 +401,7 @@ Health 체크: `http://localhost:8080/actuator/health`
 .\mvnw.cmd test -Dtest=PaymentServiceMySqlConcurrencyTest
 ```
 
-`PaymentServiceMySqlConcurrencyTest`를 포함해 전체 46개 테스트가 통과합니다 — 이전에 실패했던 2건의 원인과 수정 내역은 [검증 (테스트)](#검증-테스트) 섹션 참고.
+`PaymentServiceMySqlConcurrencyTest`를 포함해 전체 53개 테스트가 통과합니다(GitHub Actions에서도 매 push마다 `mvn clean verify`로 실행) — 이전에 실패했던 2건의 원인과 수정 내역은 [검증 (테스트)](#검증-테스트) 섹션 참고.
 
 ---
 

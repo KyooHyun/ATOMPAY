@@ -15,6 +15,9 @@ import java.time.OffsetDateTime;
 @Service
 public class AuditLogService {
 
+    /** audit_log.failure_reason VARCHAR(255). */
+    static final int MAX_FAILURE_REASON_LENGTH = 255;
+
     private final AuditLogRepository auditLogRepository;
 
     public AuditLogService(AuditLogRepository auditLogRepository) {
@@ -38,7 +41,19 @@ public class AuditLogService {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void recordFailure(TransactionType action, String authorizationId, String cardId,
                               BigDecimal amount, String failureReason) {
-        save(action, authorizationId, cardId, amount, false, failureReason);
+        save(action, authorizationId, cardId, amount, false, truncate(failureReason));
+    }
+
+    /**
+     * Exception messages can be far longer than audit_log.failure_reason —
+     * a MySQL deadlock message carries the whole SQL statement. Without this,
+     * the audit insert itself failed and replaced the original exception.
+     */
+    private static String truncate(String failureReason) {
+        if (failureReason == null || failureReason.length() <= MAX_FAILURE_REASON_LENGTH) {
+            return failureReason;
+        }
+        return failureReason.substring(0, MAX_FAILURE_REASON_LENGTH - 3) + "...";
     }
 
     private void save(TransactionType action, String authorizationId, String cardId, BigDecimal amount,

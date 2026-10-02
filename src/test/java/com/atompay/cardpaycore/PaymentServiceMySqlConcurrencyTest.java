@@ -1,11 +1,13 @@
 package com.atompay.cardpaycore;
 
+import com.atompay.cardpaycore.domain.entity.AuditLog;
 import com.atompay.cardpaycore.domain.entity.CardAccount;
 import com.atompay.cardpaycore.domain.enums.CardAccountStatus;
 import com.atompay.cardpaycore.domain.enums.TransactionType;
 import com.atompay.cardpaycore.dto.AmountRequest;
 import com.atompay.cardpaycore.dto.AuthorizeRequest;
 import com.atompay.cardpaycore.dto.PaymentResponse;
+import com.atompay.cardpaycore.repository.AuditLogRepository;
 import com.atompay.cardpaycore.repository.AuthorizationRepository;
 import com.atompay.cardpaycore.repository.CardAccountRepository;
 import com.atompay.cardpaycore.repository.IdempotencyKeyRepository;
@@ -32,11 +34,13 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.math.BigDecimal;
+import java.time.OffsetDateTime;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -86,6 +90,9 @@ class PaymentServiceMySqlConcurrencyTest {
 
     @Autowired
     private IdempotencyService idempotencyService;
+
+    @Autowired
+    private AuditLogRepository auditLogRepository;
 
     @BeforeEach
     void setUp() {
@@ -306,6 +313,79 @@ class PaymentServiceMySqlConcurrencyTest {
 
         // Once the holder is gone, the same key goes through.
         assertThat(paymentService.authorize(request, "held-key").getStatus()).isEqualTo("AUTHORIZED");
+    }
+
+    /**
+     * README §15 claims a deadlock victim is safe to retry with the same key.
+     * That rests on two things this test checks against a real InnoDB
+     * deadlock, not a mocked exception:
+     * 1. the victim surfaces as a PessimisticLockingFailureException (what
+     *    GlobalExceptionHandler maps to 409), not something that becomes 500;
+     * 2. the victim's whole transaction is gone — no status change, no
+     *    restored amount, key left IN_PROGRESS and unlocked — so a retry
+     *    with the same key runs the cancel exactly once.
+     *
+     * The other side takes CardAccount then Authorization (the reverse of
+     * cancel's order) to force the cycle, and writes rows first so InnoDB,
+     * which rolls back the transaction that has done less work, picks the
+     * cancel as the victim.
+     */
+    @Test
+    void deadlockVictimShouldBeRetryableWithTheSameKeyAndTakeEffectOnce() throws Exception {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(80_000));
+        String authorizationId = paymentService.authorize(request, "victim-auth").getAuthorizationId();
+        BigDecimal afterAuthorize = availableAmount();
+
+        CountDownLatch cardLocked = new CountDownLatch(1);
+        ExecutorService other = Executors.newSingleThreadExecutor();
+        Future<?> otherSide = other.submit(() -> new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+            for (int i = 0; i < 50; i++) {
+                auditLogRepository.save(new AuditLog("deadlock-test", TransactionType.CANCEL, null, null,
+                        BigDecimal.ONE, true, null, null, OffsetDateTime.now()));
+            }
+            auditLogRepository.flush();
+            cardAccountRepository.findByCardIdForUpdate("CARD-001").orElseThrow();
+            cardLocked.countDown();
+            try {
+                Thread.sleep(700); // let the cancel take the Authorization lock and block on the card
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            authorizationRepository.findByAuthorizationIdForUpdate(authorizationId).orElseThrow();
+            status.setRollbackOnly();
+        }));
+
+        assertThat(cardLocked.await(5, TimeUnit.SECONDS)).isTrue();
+        assertThatThrownBy(() -> paymentService.cancel(authorizationId, "victim-cancel"))
+                .isInstanceOf(PessimisticLockingFailureException.class)
+                .hasMessageContaining("Deadlock");
+        otherSide.get(10, TimeUnit.SECONDS);
+        other.shutdown();
+
+        // Nothing of the victim survived...
+        assertThat(authorizationRepository.findByAuthorizationId(authorizationId).orElseThrow().getStatus().name())
+                .isEqualTo("AUTHORIZED");
+        assertThat(availableAmount()).isEqualByComparingTo(afterAuthorize);
+        assertThat(idempotencyKeyRepository.findByActorAndKeyValue("system", "victim-cancel").orElseThrow().isCompleted())
+                .isFalse();
+        // ...except the record that the attempt failed. (Its reason used to
+        // overflow failure_reason, and that insert error replaced the 409.)
+        assertThat(auditLogRepository.findByAuthorizationIdOrderByCreatedAtAsc(authorizationId))
+                .anySatisfy(entry -> {
+                    assertThat(entry.getAction()).isEqualTo(TransactionType.CANCEL);
+                    assertThat(entry.isSuccess()).isFalse();
+                    assertThat(entry.getFailureReason()).contains("Deadlock").hasSizeLessThanOrEqualTo(255);
+                });
+
+        // ...so the client's retry with the same key cancels exactly once.
+        assertThat(paymentService.cancel(authorizationId, "victim-cancel").getStatus()).isEqualTo("CANCELLED");
+        assertThat(paymentService.cancel(authorizationId, "victim-cancel").getStatus()).isEqualTo("CANCELLED");
+        assertThat(availableAmount()).isEqualByComparingTo(afterAuthorize.add(BigDecimal.valueOf(80_000)));
+        assertThat(paymentTransactionRepository.findByAuthorizationIdOrderByCreatedAtAsc(authorizationId))
+                .extracting(transaction -> transaction.getTransactionType())
+                .containsExactly(TransactionType.AUTHORIZATION, TransactionType.CANCEL);
     }
 
     private BigDecimal availableAmount() {

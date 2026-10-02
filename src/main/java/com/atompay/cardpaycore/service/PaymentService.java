@@ -397,8 +397,16 @@ public class PaymentService {
             // Recorded after the business transaction has rolled back, in a
             // transaction of its own — the failed attempt must stay on record.
             if (operationStarted[0]) {
-                auditLogService.recordFailure(failedAttempt.action(), failedAttempt.authorizationId(),
-                        failedAttempt.cardId(), failedAttempt.amount(), ex.getMessage());
+                // The audit write must never replace the exception the client
+                // is owed (e.g. turn a retryable 409 into a 500).
+                try {
+                    auditLogService.recordFailure(failedAttempt.action(), failedAttempt.authorizationId(),
+                            failedAttempt.cardId(), failedAttempt.amount(), ex.getMessage());
+                } catch (RuntimeException auditEx) {
+                    log.error("Failed to record failure audit entry: action={}, authorizationId={}",
+                            failedAttempt.action(), failedAttempt.authorizationId(), auditEx);
+                    ex.addSuppressed(auditEx);
+                }
             }
             throw ex;
         }

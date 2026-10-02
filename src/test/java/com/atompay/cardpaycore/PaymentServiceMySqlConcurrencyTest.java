@@ -22,8 +22,10 @@ import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -37,6 +39,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @Testcontainers
 @DataJpaTest
@@ -76,6 +79,9 @@ class PaymentServiceMySqlConcurrencyTest {
     @Autowired
     private PaymentService paymentService;
 
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+
     @BeforeEach
     void setUp() {
         paymentTransactionRepository.deleteAllInBatch();
@@ -101,7 +107,153 @@ class PaymentServiceMySqlConcurrencyTest {
         PaymentResponse response = paymentService.authorize(request, "fresh-key-regression");
 
         assertThat(response.getStatus()).isEqualTo("AUTHORIZED");
-        assertThat(idempotencyKeyRepository.findByKeyValue("fresh-key-regression")).isPresent();
+        assertThat(idempotencyKeyRepository.findByActorAndKeyValue("system", "fresh-key-regression")).isPresent();
+    }
+
+    /**
+     * Regression test for the stuck-idempotency-key bug: the placeholder is
+     * committed up front in its own REQUIRES_NEW transaction, so if the outer
+     * transaction then fails *at commit* (deadlock victim, dropped connection)
+     * or the process dies mid-request, nothing ever cleaned it up — the
+     * failure happened outside the operation's catch block. Every retry with
+     * that key was then rejected as "already being processed", forever.
+     *
+     * An enclosing transaction that rolls back after authorize() has returned
+     * reproduces exactly that: the business writes and the cached response
+     * roll back, the already-committed placeholder does not.
+     */
+    @Test
+    void mySqlShouldAllowRetryAfterOuterTransactionRollsBackPastTheOperation() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(70_000));
+
+        TransactionTemplate outer = new TransactionTemplate(transactionManager);
+        assertThatThrownBy(() -> outer.executeWithoutResult(status -> {
+            paymentService.authorize(request, "commit-fails-key");
+            throw new IllegalStateException("simulated commit failure");
+        })).hasMessage("simulated commit failure");
+
+        // The first attempt left no business effect behind...
+        assertThat(authorizationRepository.count()).isZero();
+        assertThat(availableAmount()).isEqualByComparingTo(BigDecimal.valueOf(5_000_000));
+
+        // ...so the client's retry with the same key must execute it, once.
+        PaymentResponse retried = paymentService.authorize(request, "commit-fails-key");
+
+        assertThat(retried.getStatus()).isEqualTo("AUTHORIZED");
+        assertThat(authorizationRepository.count()).isEqualTo(1);
+        assertThat(availableAmount()).isEqualByComparingTo(BigDecimal.valueOf(4_930_000));
+
+        // And a further retry is now a plain replay.
+        assertThat(paymentService.authorize(request, "commit-fails-key").getAuthorizationId())
+                .isEqualTo(retried.getAuthorizationId());
+    }
+
+    /**
+     * Two copies of the same request racing on one key (a client retry fired
+     * before the first response arrived). The loser used to observe the
+     * winner's empty placeholder and fail with "already being processed";
+     * it now waits on the winner's row lock and replays its response.
+     */
+    @Test
+    void mySqlConcurrentDuplicatesWithSameKeyShouldExecuteOnceAndBothGetTheResult() throws InterruptedException {
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch endLatch = new CountDownLatch(2);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        CopyOnWriteArrayList<String> authorizationIds = new CopyOnWriteArrayList<>();
+        CopyOnWriteArrayList<String> failures = new CopyOnWriteArrayList<>();
+
+        for (int index = 0; index < 2; index++) {
+            executor.submit(() -> {
+                try {
+                    startLatch.await();
+                    AuthorizeRequest request = new AuthorizeRequest();
+                    request.setCardId("CARD-001");
+                    request.setAmount(BigDecimal.valueOf(40_000));
+                    authorizationIds.add(paymentService.authorize(request, "same-key-race").getAuthorizationId());
+                } catch (Exception ex) {
+                    failures.add(ex.getClass().getSimpleName() + ": " + ex.getMessage());
+                } finally {
+                    endLatch.countDown();
+                }
+            });
+        }
+
+        startLatch.countDown();
+        endLatch.await(15, TimeUnit.SECONDS);
+        executor.shutdownNow();
+
+        assertThat(failures).isEmpty();
+        assertThat(authorizationIds).hasSize(2);
+        assertThat(authorizationIds.get(0)).isEqualTo(authorizationIds.get(1));
+        assertThat(authorizationRepository.count()).isEqualTo(1);
+        assertThat(availableAmount()).isEqualByComparingTo(BigDecimal.valueOf(4_960_000));
+    }
+
+    /**
+     * capture and cancel both start from AUTHORIZED and are mutually
+     * exclusive. Racing them must produce exactly one winner, and the card's
+     * available amount must match whichever one won: cancel restores the full
+     * hold, capture keeps it deducted. Without the Authorization row lock
+     * both could read AUTHORIZED, and the card would end up with a captured
+     * payment whose hold had also been released.
+     */
+    @Test
+    void mySqlConcurrentCaptureAndCancelShouldHaveExactlyOneWinner() throws InterruptedException {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(250_000));
+        PaymentResponse authorization = paymentService.authorize(request, "key-race-auth");
+        String authorizationId = authorization.getAuthorizationId();
+
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch endLatch = new CountDownLatch(2);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        CopyOnWriteArrayList<String> winners = new CopyOnWriteArrayList<>();
+
+        executor.submit(() -> {
+            try {
+                startLatch.await();
+                paymentService.capture(authorizationId, BigDecimal.valueOf(250_000), "key-race-capture");
+                winners.add("capture");
+            } catch (Exception ignored) {
+            } finally {
+                endLatch.countDown();
+            }
+        });
+        executor.submit(() -> {
+            try {
+                startLatch.await();
+                paymentService.cancel(authorizationId, "key-race-cancel");
+                winners.add("cancel");
+            } catch (Exception ignored) {
+            } finally {
+                endLatch.countDown();
+            }
+        });
+
+        startLatch.countDown();
+        endLatch.await(15, TimeUnit.SECONDS);
+        executor.shutdownNow();
+
+        assertThat(winners).hasSize(1);
+        String finalStatus = authorizationRepository.findByAuthorizationId(authorizationId).orElseThrow().getStatus().name();
+        if (winners.get(0).equals("capture")) {
+            assertThat(finalStatus).isEqualTo("CAPTURED");
+            assertThat(availableAmount()).isEqualByComparingTo(BigDecimal.valueOf(4_750_000));
+        } else {
+            assertThat(finalStatus).isEqualTo("CANCELLED");
+            assertThat(availableAmount()).isEqualByComparingTo(BigDecimal.valueOf(5_000_000));
+        }
+        assertThat(paymentTransactionRepository.findByAuthorizationIdOrderByCreatedAtAsc(authorizationId))
+                .extracting(transaction -> transaction.getTransactionType())
+                .containsExactly(TransactionType.AUTHORIZATION,
+                        winners.get(0).equals("capture") ? TransactionType.CAPTURE : TransactionType.CANCEL);
+    }
+
+    private BigDecimal availableAmount() {
+        return cardAccountRepository.findByCardId("CARD-001").map(CardAccount::getAvailableAmount).orElseThrow();
     }
 
     @Test

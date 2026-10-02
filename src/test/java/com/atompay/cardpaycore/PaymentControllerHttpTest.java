@@ -59,4 +59,24 @@ class PaymentControllerHttpTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$[0].action").value("AUTHORIZATION"));
     }
+
+    @Test
+    @WithMockUser(username = "admin")
+    void idempotencyKeyReuseWithDifferentBodyShouldBe422() throws Exception {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(2_000));
+        mockMvc.perform(post("/api/v1/payments/authorize")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("Idempotency-Key", "mockmvc-reuse-test")
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk());
+
+        request.setAmount(BigDecimal.valueOf(3_000));
+        mockMvc.perform(post("/api/v1/payments/authorize")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("Idempotency-Key", "mockmvc-reuse-test")
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isUnprocessableEntity());
+    }
 }

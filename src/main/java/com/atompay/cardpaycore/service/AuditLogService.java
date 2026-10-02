@@ -3,9 +3,8 @@ package com.atompay.cardpaycore.service;
 import com.atompay.cardpaycore.domain.entity.AuditLog;
 import com.atompay.cardpaycore.domain.enums.TransactionType;
 import com.atompay.cardpaycore.repository.AuditLogRepository;
+import com.atompay.cardpaycore.security.CurrentActor;
 import org.slf4j.MDC;
-import org.springframework.security.core.Authentication;
-import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -43,7 +42,7 @@ public class AuditLogService {
     private void save(TransactionType action, String authorizationId, String cardId, BigDecimal amount,
                       boolean success, String failureReason) {
         auditLogRepository.save(new AuditLog(
-                resolveActor(),
+                CurrentActor.resolve(),
                 action,
                 authorizationId,
                 cardId,
@@ -53,13 +52,5 @@ public class AuditLogService {
                 MDC.get("requestId"),
                 OffsetDateTime.now()
         ));
-    }
-
-    private String resolveActor() {
-        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-        if (auth == null || !auth.isAuthenticated() || "anonymousUser".equals(auth.getPrincipal())) {
-            return "system";
-        }
-        return auth.getName();
     }
 }

@@ -13,6 +13,7 @@ import com.atompay.cardpaycore.dto.AuthorizeRequest;
 import com.atompay.cardpaycore.dto.PaymentResponse;
 import com.atompay.cardpaycore.dto.PaymentTransactionResponse;
 import com.atompay.cardpaycore.exception.BadRequestException;
+import com.atompay.cardpaycore.exception.IdempotencyKeyReuseException;
 import com.atompay.cardpaycore.exception.NotFoundException;
 import com.atompay.cardpaycore.dto.AuditLogResponse;
 import com.atompay.cardpaycore.repository.AuditLogRepository;
@@ -20,10 +21,12 @@ import com.atompay.cardpaycore.repository.AuthorizationRepository;
 import com.atompay.cardpaycore.repository.CardAccountRepository;
 import com.atompay.cardpaycore.repository.IdempotencyKeyRepository;
 import com.atompay.cardpaycore.repository.PaymentTransactionRepository;
+import com.atompay.cardpaycore.security.CurrentActor;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.stereotype.Service;
 
@@ -42,6 +45,9 @@ import java.util.function.Supplier;
 public class PaymentService {
 
     private static final Logger log = LoggerFactory.getLogger(PaymentService.class);
+
+    /** Matches idempotency_key.key_value VARCHAR(64); longer keys would fail at insert as a 500. */
+    private static final int MAX_IDEMPOTENCY_KEY_LENGTH = 64;
 
     private final ObjectMapper objectMapper;
     private final CardAccountRepository cardAccountRepository;
@@ -332,65 +338,94 @@ public class PaymentService {
     }
 
     /**
-     * Idempotency flow:
-     * 1. Check for existing cached response — return it immediately if found.
-     * 2. Reserve a placeholder in its own REQUIRES_NEW transaction so a DB
-     *    constraint violation never taints the outer EntityManager.
-     * 3. Run the business operation inside the outer @Transactional.
-     * 4. On success: update the placeholder with the response (same outer tx,
-     *    so payment data and idempotency record commit atomically).
-     * 5. On failure: delete the placeholder in a new REQUIRES_NEW transaction
-     *    so the key is available for retries.
+     * Idempotency flow. The row lock on the key — not a status column, not
+     * a timeout — is what says "someone is working on this right now":
+     *
+     * 1. Fast path: a COMPLETED key replays its cached response.
+     * 2. Otherwise make sure a row exists: reserve an IN_PROGRESS placeholder
+     *    in its own committed REQUIRES_NEW transaction. Losing that insert
+     *    race to a concurrent duplicate is fine — the row exists either way.
+     * 3. Lock the row (SELECT ... FOR UPDATE) in the outer transaction. If
+     *    another request owns it, this blocks until that request commits or
+     *    rolls back.
+     * 4. With the lock held: COMPLETED means a concurrent duplicate finished
+     *    first — replay it. IN_PROGRESS means nobody completed it: either we
+     *    just reserved it, or the previous owner's transaction rolled back
+     *    (business failure, failed commit, crashed process) and took all its
+     *    business writes with it. Either way it's safe to run the operation.
+     * 5. Run the operation and mark the key COMPLETED in the same outer
+     *    transaction, so the payment and its cached response commit or roll
+     *    back together.
+     *
+     * Nothing ever deletes the placeholder on failure. A REQUIRES_NEW delete
+     * would wait on the very row lock its own outer transaction holds; and
+     * cleanup that has to run never runs when the failure is the commit
+     * itself, or a dead process — which is how keys used to get stuck.
      */
     private PaymentResponse handleIdempotentRequest(String idempotencyKey,
                                                      String requestUri,
                                                      String requestBodyHash,
                                                      Supplier<PaymentResponse> operation) {
-        Optional<IdempotencyKey> existing = idempotencyKeyRepository.findByKeyValue(idempotencyKey);
-        if (existing.isPresent()) {
-            return resolveExistingKey(existing.get(), requestUri, requestBodyHash);
-        }
+        validateIdempotencyKey(idempotencyKey);
+        String actor = CurrentActor.resolve();
 
-        boolean reserved = idempotencyService.tryReservePlaceholder(idempotencyKey, requestUri, requestBodyHash);
-        if (!reserved) {
-            IdempotencyKey concurrent = idempotencyKeyRepository.findByKeyValueForUpdate(idempotencyKey)
-                    .orElseThrow(() -> new BadRequestException("Idempotency key is already being processed. Retry later."));
-            return resolveExistingKey(concurrent, requestUri, requestBodyHash);
+        Optional<IdempotencyKey> existing = idempotencyKeyRepository.findByActorAndKeyValue(actor, idempotencyKey);
+        if (existing.isPresent() && existing.get().isCompleted()) {
+            return replay(existing.get(), requestUri, requestBodyHash);
         }
-
-        try {
-            PaymentResponse response = operation.get();
-            IdempotencyKey placeholder = idempotencyKeyRepository.findByKeyValueForUpdate(idempotencyKey)
-                    .orElseThrow(() -> new IllegalStateException("Idempotency placeholder was unexpectedly removed"));
-            placeholder.setResponsePayload(serializeResponse(response));
-            idempotencyKeyRepository.save(placeholder);
-            return response;
-        } catch (RuntimeException ex) {
+        if (existing.isEmpty()) {
             try {
-                idempotencyService.releaseOnFailure(idempotencyKey);
-            } catch (Exception cleanupEx) {
-                log.warn("Failed to release idempotency placeholder: key={}", idempotencyKey, cleanupEx);
+                idempotencyService.reservePlaceholder(actor, idempotencyKey, requestUri, requestBodyHash);
+            } catch (DataIntegrityViolationException ex) {
+                log.debug("Idempotency key reserved by a concurrent request, waiting on its lock: key={}", idempotencyKey);
             }
-            throw ex;
+        }
+
+        IdempotencyKey key = idempotencyKeyRepository.findByActorAndKeyValueForUpdate(actor, idempotencyKey)
+                .orElseThrow(() -> new IllegalStateException("Idempotency placeholder was unexpectedly removed"));
+        if (key.isCompleted()) {
+            return replay(key, requestUri, requestBodyHash);
+        }
+        if (!key.matches(requestUri, requestBodyHash)) {
+            log.info("Taking over abandoned idempotency key for a different request: key={}", idempotencyKey);
+        }
+        key.takeOver(requestUri, requestBodyHash);
+
+        PaymentResponse response = operation.get();
+        key.complete(serializeResponse(response));
+        idempotencyKeyRepository.save(key);
+        return response;
+    }
+
+    private void validateIdempotencyKey(String idempotencyKey) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            throw new BadRequestException("Idempotency-Key header must not be blank.");
+        }
+        if (idempotencyKey.length() > MAX_IDEMPOTENCY_KEY_LENGTH) {
+            throw new BadRequestException("Idempotency-Key must be at most " + MAX_IDEMPOTENCY_KEY_LENGTH + " characters.");
         }
     }
 
-    private PaymentResponse resolveExistingKey(IdempotencyKey key, String requestUri, String requestBodyHash) {
-        if (!key.getRequestUri().equals(requestUri) || !key.getRequestBodyHash().equals(requestBodyHash)) {
-            throw new BadRequestException("Idempotency key reuse with different request body is not allowed.");
-        }
-        if (key.getResponsePayload().isBlank()) {
-            throw new BadRequestException("Idempotency key is already being processed. Retry later.");
+    private PaymentResponse replay(IdempotencyKey key, String requestUri, String requestBodyHash) {
+        if (!key.matches(requestUri, requestBodyHash)) {
+            throw new IdempotencyKeyReuseException("Idempotency key reuse with different request body is not allowed.");
         }
         log.debug("Returning cached idempotent response for key={}", key.getKeyValue());
         return deserializeResponse(key.getResponsePayload());
     }
 
+    /**
+     * BigDecimals are hashed by numeric value, not representation: a client
+     * that sends 100 and retries with 100.00 is retrying the same request.
+     */
     private String generateRequestBodyHash(Object... values) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             for (Object value : values) {
-                digest.update((value == null ? "" : value.toString()).getBytes(StandardCharsets.UTF_8));
+                String canonical = value instanceof BigDecimal decimal
+                        ? decimal.stripTrailingZeros().toPlainString()
+                        : (value == null ? "" : value.toString());
+                digest.update(canonical.getBytes(StandardCharsets.UTF_8));
                 digest.update((byte) 0); // NUL-byte separator prevents cross-field collisions
             }
             return Base64.getEncoder().encodeToString(digest.digest());

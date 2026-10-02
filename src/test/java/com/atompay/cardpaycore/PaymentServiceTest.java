@@ -10,6 +10,7 @@ import com.atompay.cardpaycore.dto.PaymentTransactionResponse;
 import com.atompay.cardpaycore.domain.entity.AuditLog;
 import com.atompay.cardpaycore.dto.AuditLogResponse;
 import com.atompay.cardpaycore.exception.BadRequestException;
+import com.atompay.cardpaycore.exception.IdempotencyKeyReuseException;
 import com.atompay.cardpaycore.repository.AuditLogRepository;
 import com.atompay.cardpaycore.repository.AuthorizationRepository;
 import com.atompay.cardpaycore.repository.CardAccountRepository;
@@ -23,6 +24,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.context.transaction.BeforeTransaction;
 
@@ -111,8 +114,61 @@ class PaymentServiceTest {
         differentRequest.setCardId("CARD-001");
         differentRequest.setAmount(BigDecimal.valueOf(200_000));
 
-        assertThrows(BadRequestException.class,
+        assertThrows(IdempotencyKeyReuseException.class,
                 () -> paymentService.authorize(differentRequest, "key-123"));
+    }
+
+    @Test
+    void idempotentRetryWithDifferentDecimalScaleShouldReplayNotReject() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(new BigDecimal("100"));
+        PaymentResponse first = paymentService.authorize(request, "key-scale");
+
+        // Same amount, different representation — a client re-serializing
+        // its retry must not be told it's a different request.
+        AuthorizeRequest retry = new AuthorizeRequest();
+        retry.setCardId("CARD-001");
+        retry.setAmount(new BigDecimal("100.00"));
+        PaymentResponse second = paymentService.authorize(retry, "key-scale");
+
+        assertThat(second.getAuthorizationId()).isEqualTo(first.getAuthorizationId());
+        assertThat(authorizationRepository.count()).isEqualTo(1);
+    }
+
+    @Test
+    void sameIdempotencyKeyFromDifferentActorsShouldNotShareResponses() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(10_000));
+
+        PaymentResponse merchantA = runAs("merchant-a", () -> paymentService.authorize(request, "order-1"));
+        PaymentResponse merchantB = runAs("merchant-b", () -> paymentService.authorize(request, "order-1"));
+
+        assertThat(merchantB.getAuthorizationId()).isNotEqualTo(merchantA.getAuthorizationId());
+        assertThat(authorizationRepository.count()).isEqualTo(2);
+        assertThat(idempotencyKeyRepository.findByActorAndKeyValue("merchant-a", "order-1")).isPresent();
+        assertThat(idempotencyKeyRepository.findByActorAndKeyValue("merchant-b", "order-1")).isPresent();
+    }
+
+    @Test
+    void idempotencyKeyLongerThanColumnShouldBeRejectedAsBadRequest() {
+        AuthorizeRequest request = new AuthorizeRequest();
+        request.setCardId("CARD-001");
+        request.setAmount(BigDecimal.valueOf(10_000));
+
+        assertThrows(BadRequestException.class, () -> paymentService.authorize(request, "k".repeat(65)));
+        assertThat(authorizationRepository.count()).isZero();
+    }
+
+    private <T> T runAs(String username, java.util.function.Supplier<T> action) {
+        SecurityContextHolder.getContext().setAuthentication(
+                new UsernamePasswordAuthenticationToken(username, null, List.of()));
+        try {
+            return action.get();
+        } finally {
+            SecurityContextHolder.clearContext();
+        }
     }
 
     @Test

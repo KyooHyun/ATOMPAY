@@ -10,18 +10,20 @@ import jakarta.persistence.LockModeType;
 import java.util.Optional;
 
 public interface IdempotencyKeyRepository extends JpaRepository<IdempotencyKey, Long> {
-    Optional<IdempotencyKey> findByKeyValue(String keyValue);
+    Optional<IdempotencyKey> findByActorAndKeyValue(String actor, String keyValue);
 
     /**
-     * Locking read that bypasses the transaction's REPEATABLE READ snapshot.
-     * A plain findByKeyValue re-read here would still see "not found" if the
-     * placeholder was inserted by a sibling REQUIRES_NEW transaction after
-     * this transaction's first (snapshot-establishing) read -- InnoDB locking
-     * reads always read the latest committed row, not the snapshot.
+     * Locking read. Two jobs:
+     * 1. It bypasses the transaction's REPEATABLE READ snapshot. A plain
+     *    re-read would still see "not found" if the placeholder was inserted
+     *    by a sibling REQUIRES_NEW transaction after this transaction's first
+     *    (snapshot-establishing) read -- InnoDB locking reads always read the
+     *    latest committed row.
+     * 2. Holding the lock until commit is what marks the key as owned. A
+     *    duplicate request blocks here until the owner commits or rolls back.
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
-    @Query("select k from IdempotencyKey k where k.keyValue = :keyValue")
-    Optional<IdempotencyKey> findByKeyValueForUpdate(@Param("keyValue") String keyValue);
-
-    void deleteByKeyValue(String keyValue);
+    @Query("select k from IdempotencyKey k where k.actor = :actor and k.keyValue = :keyValue")
+    Optional<IdempotencyKey> findByActorAndKeyValueForUpdate(@Param("actor") String actor,
+                                                             @Param("keyValue") String keyValue);
 }

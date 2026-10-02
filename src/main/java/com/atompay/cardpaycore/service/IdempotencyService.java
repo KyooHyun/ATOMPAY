@@ -2,19 +2,12 @@ package com.atompay.cardpaycore.service;
 
 import com.atompay.cardpaycore.domain.entity.IdempotencyKey;
 import com.atompay.cardpaycore.repository.IdempotencyKeyRepository;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.OffsetDateTime;
-
 @Service
 public class IdempotencyService {
-
-    private static final Logger log = LoggerFactory.getLogger(IdempotencyService.class);
 
     private final IdempotencyKeyRepository idempotencyKeyRepository;
 
@@ -23,31 +16,17 @@ public class IdempotencyService {
     }
 
     /**
-     * Inserts a placeholder row in its own committed transaction so the outer
-     * transaction's EntityManager is never tainted by a constraint violation.
-     * Returns true if the placeholder was created (caller may proceed), false
-     * if a concurrent request already owns this key (caller must re-read).
+     * Inserts the placeholder in its own committed transaction, so the row
+     * exists (and the unique constraint arbitrates) before the outer
+     * transaction does any business work.
+     *
+     * Throws DataIntegrityViolationException if another request already
+     * reserved this key. It must not be caught in here: by then the
+     * repository has marked this transaction rollback-only, and swallowing
+     * the exception turns it into an UnexpectedRollbackException at commit.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public boolean tryReservePlaceholder(String keyValue, String requestUri, String requestBodyHash) {
-        try {
-            idempotencyKeyRepository.saveAndFlush(
-                    new IdempotencyKey(keyValue, requestUri, requestBodyHash, "", OffsetDateTime.now())
-            );
-            return true;
-        } catch (DataIntegrityViolationException ex) {
-            log.debug("Idempotency key already reserved by concurrent request: key={}", keyValue);
-            return false;
-        }
-    }
-
-    /**
-     * Deletes the placeholder in its own committed transaction so that a
-     * failed business operation does not permanently block retries.
-     */
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void releaseOnFailure(String keyValue) {
-        idempotencyKeyRepository.deleteByKeyValue(keyValue);
-        log.debug("Released idempotency placeholder after failure: key={}", keyValue);
+    public void reservePlaceholder(String actor, String keyValue, String requestUri, String requestBodyHash) {
+        idempotencyKeyRepository.saveAndFlush(IdempotencyKey.placeholder(actor, keyValue, requestUri, requestBodyHash));
     }
 }

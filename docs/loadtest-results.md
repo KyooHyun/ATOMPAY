@@ -1,5 +1,7 @@
 # Load test: does the pessimistic lock cost throughput?
 
+> **Re-measured 2026-10-02 — see [the section at the end](#2026-10-02-re-measurement-three-builds-side-by-side).** Two readings below were wrong and are corrected there: the pool=10 collapse was a connection-pool *deadlock* (nested transactions), not pool queueing; and the absolute numbers were depressed by SQL console logging. The "open finding" about failing Testcontainers tests was fixed on 2026-08-25 (README §9 area, "해결된 실패").
+
 **Date:** 2026-08-22
 **Question:** AtomPay uses `PESSIMISTIC_WRITE` on `CardAccount` for every balance mutation to guarantee correctness under concurrent requests (see `PaymentServiceMySqlConcurrencyTest`). The obvious follow-up question is: what does that cost in throughput, and where does the cost actually show up?
 
@@ -70,3 +72,28 @@ docker run --rm --add-host=host.docker.internal:host-gateway \
   -v "<repo>/scripts/loadtest:/scripts" \
   grafana/k6 run /scripts/contention.js   # or distributed.js
 ```
+
+## 2026-10-02 re-measurement: three builds side by side
+
+Re-run to answer "do these numbers still hold on current code?", and to price the idempotency-key row lock added in README §13.
+
+**Setup changes vs. August** (applied identically to all three builds):
+- App, MySQL 8.1 and k6 in one Docker network on one host; fresh database per run.
+- 50 VUs, 30s measured, after a discarded 10s warmup. One run per cell.
+- `SPRING_JPA_SHOW_SQL=false`. The August `mysql` profile inherited `show-sql=true` from the base properties and printed every statement — a large, uneven tax on the August numbers.
+- Rate limit raised out of the way via `RATELIMIT_PAYMENTS_LIMIT` (no code change).
+- Driver: [`scripts/loadtest/ab-compare.sh`](../scripts/loadtest/ab-compare.sh). Raw k6 summaries: [`docs/loadtest-2026-10-02/`](loadtest-2026-10-02/).
+
+| Build | Contention, pool 60 | Distributed, pool 60 | Distributed, pool 10 |
+|---|---|---|---|
+| `bc78151` before §13 | 192.7 req/s · avg 258ms · p95 265 · p99 1165 | 1446.0 req/s · avg 34ms · p95 52 · p99 74 | 1.7 req/s · 69% failed · avg 28.8s |
+| `ed49f78` §13 (key row lock, still nested tx) | 202.8 · avg 245 · p95 259 · p99 1136 | 1348.9 · avg 37 · p95 60 · p99 94 | 0.6 req/s · 70% failed · avg 28.9s |
+| `c659cfa` §15 (no nesting, current) | 207.6 · avg 240 · p95 262 · p99 1143 | 1793.8 · avg 28 · p95 39 · p99 51 | 648.8 req/s · 0% failed · avg 77ms · p95 110 |
+
+**Reading it:**
+- **Key row lock cost**: none visible under single-card contention (the card row was always the bottleneck). Under distributed load, -7% (1446 → 1349) — single runs, so not distinguishable from noise.
+- **The pool=10 collapse was a deadlock.** Every payment request held its outer transaction's connection while requesting a second one for a `REQUIRES_NEW` transaction. Once pool-size requests each hold one, none can get a second, and all wait out Hikari's 30s `connectionTimeout` — hence ~28.8s average latency and ~70% failures in both nested builds, exactly like August's 1.75 req/s / 28.4s. Pure queueing would have produced short latencies at lower throughput, not 30s timeouts. With nesting removed, the same pool of 10 serves 649 req/s with no failures. August's "pool 10 → 60 gave a 79x improvement" was real, but it worked by making the deadlock unlikely, not by relieving a queue.
+- **Side effect of removing nesting**: one connection per request instead of two roughly doubles effective pool capacity: +24% throughput (1446 → 1794) and p95 52 → 39ms at pool 60, distributed.
+- Contention p99 ≈ 1.1s: 50 VUs queue on one card row. Below the 5s `innodb_lock_wait_timeout`, so no 409s at this load.
+- The unlocked variant was not re-run; August's ~40% (contention) stands as the price of correctness.
+

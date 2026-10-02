@@ -1,0 +1,137 @@
+{
+    "root_group": {
+        "name": "",
+        "path": "",
+        "id": "d41d8cd98f00b204e9800998ecf8427e",
+        "groups": {
+            "setup": {
+                "path": "::setup",
+                "id": "5c0f8025f7e0b6654089e5b00e950f1a",
+                "groups": {},
+                "checks": {
+                        "login succeeded": {
+                            "path": "::setup::login succeeded",
+                            "id": "a7d4e67a461e12e148d0e432e39a2c96",
+                            "passes": 1,
+                            "fails": 0,
+                            "name": "login succeeded"
+                        }
+                    },
+                "name": "setup"
+            }
+        },
+        "checks": {
+            "status is 200": {
+                "passes": 59913,
+                "fails": 0,
+                "name": "status is 200",
+                "path": "::status is 200",
+                "id": "6210a8cd14cd70477eba5c5e4cb3fb5f"
+            }
+        }
+    },
+    "metrics": {
+        "http_req_duration": {
+            "avg": 27.728616677587926,
+            "med": 23.5257,
+            "p(95)": 38.67645869999999,
+            "p(99)": 51.117375350000174,
+            "max": 2432.959336
+        },
+        "http_req_blocked": {
+            "p(99)": 0.10221215000000013,
+            "max": 4.352178,
+            "avg": 0.004650955920152296,
+            "med": 0.001893,
+            "p(95)": 0.003417
+        },
+        "http_req_failed": {
+            "passes": 0,
+            "fails": 59914,
+            "value": 0
+        },
+        "iterations": {
+            "rate": 1793.8093197432097,
+            "count": 59913
+        },
+        "vus_max": {
+            "value": 50,
+            "min": 50,
+            "max": 50
+        },
+        "http_req_duration{expected_response:true}": {
+            "p(99)": 51.117375350000174,
+            "max": 2432.959336,
+            "avg": 27.728616677587926,
+            "med": 23.5257,
+            "p(95)": 38.67645869999999
+        },
+        "http_reqs": {
+            "rate": 1793.8392599785468,
+            "count": 59914
+        },
+        "http_req_tls_handshaking": {
+            "p(99)": 0,
+            "max": 0,
+            "avg": 0,
+            "med": 0,
+            "p(95)": 0
+        },
+        "http_req_receiving": {
+            "avg": 0.17384285806322497,
+            "med": 0.062059,
+            "p(95)": 0.6600515499999994,
+            "p(99)": 1.7885026000000037,
+            "max": 18.473977
+        },
+        "iteration_duration": {
+            "avg": 25.03645116328682,
+            "med": 23.607949,
+            "p(95)": 38.5703664,
+            "p(99)": 49.836195919999966,
+            "max": 143.394569
+        },
+        "http_req_connecting": {
+            "p(99)": 0.06248707000000095,
+            "max": 4.323423,
+            "avg": 0.0016906878192075327,
+            "med": 0,
+            "p(95)": 0
+        },
+        "data_sent": {
+            "count": 23240057,
+            "rate": 695812.7758243356
+        },
+        "vus": {
+            "value": 50,
+            "min": 50,
+            "max": 50
+        },
+        "data_received": {
+            "rate": 1345301.780013446,
+            "count": 44932906
+        },
+        "http_req_sending": {
+            "p(95)": 0.01855735,
+            "p(99)": 0.05514549000000007,
+            "max": 5.989634,
+            "avg": 0.01095785596020929,
+            "med": 0.007755
+        },
+        "http_req_waiting": {
+            "avg": 27.543815963564214,
+            "med": 23.341288,
+            "p(95)": 38.40834149999999,
+            "p(99)": 50.778042400000004,
+            "max": 2432.873119
+        },
+        "checks": {
+            "passes": 59914,
+            "fails": 0,
+            "value": 1
+        }
+    },
+    "setup_data": {
+        "token": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbiIsImlhdCI6MTc5MDk0MTQ1NSwiZXhwIjoxNzkwOTQ1MDU1fQ.tW0hKd8zmmx81oaGPQAVafK-LDCyV7Drzogrp9Fr_4A"
+    }
+}

@@ -1,0 +1,29 @@
+# Runs the app the way it's meant to run in production: the `mysql`
+# profile, Flyway migrations, and Hibernate `ddl-auto=validate`.
+#   JWT_SECRET=$(openssl rand -base64 32) docker compose up --build
+services:
+  mysql:
+    image: mysql:8.1.0
+    environment:
+      MYSQL_DATABASE: cardpay
+      MYSQL_USER: atompay
+      MYSQL_PASSWORD: ${DB_PASSWORD:-atompay}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root}
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_ROOT_PASSWORD:-root}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build: .
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:mysql://mysql:3306/cardpay?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      DB_USERNAME: atompay
+      DB_PASSWORD: ${DB_PASSWORD:-atompay}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set (base64, >= 32 bytes)}
+    ports:
+      - "8080:8080"

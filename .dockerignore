@@ -1,0 +1,10 @@
+target/
+.git/
+.github/
+.mvn/
+.vscode/
+.idea/
+*.log
+*.txt
+docs/
+scripts/

@@ -27,7 +27,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -57,6 +59,11 @@ public class PaymentService {
     private final IdempotencyService idempotencyService;
     private final AuditLogService auditLogService;
     private final AuditLogRepository auditLogRepository;
+    private final TransactionTemplate transactionTemplate;
+
+    /** What to write to the audit log if the operation itself fails. */
+    private record FailedAttempt(TransactionType action, String authorizationId, String cardId, BigDecimal amount) {
+    }
 
     public PaymentService(ObjectMapper objectMapper,
                           CardAccountRepository cardAccountRepository,
@@ -65,7 +72,8 @@ public class PaymentService {
                           PaymentTransactionRepository paymentTransactionRepository,
                           IdempotencyService idempotencyService,
                           AuditLogService auditLogService,
-                          AuditLogRepository auditLogRepository) {
+                          AuditLogRepository auditLogRepository,
+                          PlatformTransactionManager transactionManager) {
         this.objectMapper = objectMapper;
         this.cardAccountRepository = cardAccountRepository;
         this.authorizationRepository = authorizationRepository;
@@ -74,9 +82,9 @@ public class PaymentService {
         this.idempotencyService = idempotencyService;
         this.auditLogService = auditLogService;
         this.auditLogRepository = auditLogRepository;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
-    @Transactional
     public PaymentResponse authorize(AuthorizeRequest request, String idempotencyKey) {
         String requestBodyHash = generateRequestBodyHash(request.getCardId(), request.getAmount(),
                 request.getOriginalAmount(), request.getDiscountAmount(), request.getDiscountReasonCode());
@@ -84,100 +92,96 @@ public class PaymentService {
                 idempotencyKey,
                 "/api/v1/payments/authorize",
                 requestBodyHash,
+                new FailedAttempt(TransactionType.AUTHORIZATION, null, request.getCardId(), request.getAmount()),
                 () -> createAuthorization(request)
         );
     }
 
-    @Transactional
     public PaymentResponse capture(String authorizationId, BigDecimal amount, String idempotencyKey) {
         String requestBodyHash = generateRequestBodyHash(authorizationId, amount);
         return handleIdempotentRequest(
                 idempotencyKey,
                 "/api/v1/payments/" + authorizationId + "/capture",
                 requestBodyHash,
+                new FailedAttempt(TransactionType.CAPTURE, authorizationId, null, amount),
                 () -> doCapture(authorizationId, amount)
         );
     }
 
-    @Transactional
     public PaymentResponse cancel(String authorizationId, String idempotencyKey) {
         String requestBodyHash = generateRequestBodyHash(authorizationId);
         return handleIdempotentRequest(
                 idempotencyKey,
                 "/api/v1/payments/" + authorizationId + "/cancel",
                 requestBodyHash,
+                new FailedAttempt(TransactionType.CANCEL, authorizationId, null, null),
                 () -> doCancel(authorizationId)
         );
     }
 
-    @Transactional
     public PaymentResponse partialRefund(String authorizationId, BigDecimal amount, String idempotencyKey) {
         String requestBodyHash = generateRequestBodyHash(authorizationId, amount);
         return handleIdempotentRequest(
                 idempotencyKey,
                 "/api/v1/payments/" + authorizationId + "/partial-refund",
                 requestBodyHash,
+                new FailedAttempt(TransactionType.PARTIAL_REFUND, authorizationId, null, amount),
                 () -> doPartialRefund(authorizationId, amount)
         );
     }
 
-    @Transactional
     public PaymentResponse refund(String authorizationId, BigDecimal amount, String idempotencyKey) {
         String requestBodyHash = generateRequestBodyHash(authorizationId, amount);
         return handleIdempotentRequest(
                 idempotencyKey,
                 "/api/v1/payments/" + authorizationId + "/refund",
                 requestBodyHash,
+                new FailedAttempt(TransactionType.REFUND, authorizationId, null, amount),
                 () -> doRefund(authorizationId, amount)
         );
     }
 
     private PaymentResponse createAuthorization(AuthorizeRequest request) {
-        try {
-            AuthorizationKind kind = validateAndResolveKind(request);
+        AuthorizationKind kind = validateAndResolveKind(request);
 
-            CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(request.getCardId())
-                    .orElseThrow(() -> new NotFoundException("Card account not found: " + request.getCardId()));
+        CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(request.getCardId())
+                .orElseThrow(() -> new NotFoundException("Card account not found: " + request.getCardId()));
 
-            if (cardAccount.getStatus() != CardAccountStatus.ACTIVE) {
-                throw new BadRequestException("Card account is not active.");
-            }
-
-            boolean isZeroCharge = request.getAmount().compareTo(BigDecimal.ZERO) == 0;
-            if (!isZeroCharge) {
-                if (cardAccount.getAvailableAmount().compareTo(request.getAmount()) < 0) {
-                    throw new BadRequestException("Available credit limit is insufficient.");
-                }
-                cardAccount.deductAvailableAmount(request.getAmount());
-                cardAccountRepository.save(cardAccount);
-            }
-
-            String authorizationId = UUID.randomUUID().toString();
-            Authorization authorization = new Authorization(
-                    authorizationId,
-                    cardAccount.getCardId(),
-                    request.getAmount(),
-                    AuthorizationStatus.AUTHORIZED,
-                    BigDecimal.ZERO,
-                    OffsetDateTime.now(),
-                    OffsetDateTime.now(),
-                    kind,
-                    request.getOriginalAmount(),
-                    request.getDiscountAmount(),
-                    request.getDiscountReasonCode()
-            );
-            authorizationRepository.save(authorization);
-            recordTransaction(authorization, TransactionType.AUTHORIZATION, authorization.getAmount());
-            auditLogService.recordSuccess(TransactionType.AUTHORIZATION, authorizationId, cardAccount.getCardId(), authorization.getAmount());
-
-            log.info("Authorization created: authorizationId={}, cardId={}, amount={}, kind={}",
-                    authorizationId, cardAccount.getCardId(), request.getAmount(), kind);
-
-            return mapToResponse(authorization);
-        } catch (RuntimeException ex) {
-            auditLogService.recordFailure(TransactionType.AUTHORIZATION, null, request.getCardId(), request.getAmount(), ex.getMessage());
-            throw ex;
+        if (cardAccount.getStatus() != CardAccountStatus.ACTIVE) {
+            throw new BadRequestException("Card account is not active.");
         }
+
+        boolean isZeroCharge = request.getAmount().compareTo(BigDecimal.ZERO) == 0;
+        if (!isZeroCharge) {
+            if (cardAccount.getAvailableAmount().compareTo(request.getAmount()) < 0) {
+                throw new BadRequestException("Available credit limit is insufficient.");
+            }
+            cardAccount.deductAvailableAmount(request.getAmount());
+            cardAccountRepository.save(cardAccount);
+        }
+
+        String authorizationId = UUID.randomUUID().toString();
+        Authorization authorization = new Authorization(
+                authorizationId,
+                cardAccount.getCardId(),
+                request.getAmount(),
+                AuthorizationStatus.AUTHORIZED,
+                BigDecimal.ZERO,
+                OffsetDateTime.now(),
+                OffsetDateTime.now(),
+                kind,
+                request.getOriginalAmount(),
+                request.getDiscountAmount(),
+                request.getDiscountReasonCode()
+        );
+        authorizationRepository.save(authorization);
+        recordTransaction(authorization, TransactionType.AUTHORIZATION, authorization.getAmount());
+        auditLogService.recordSuccess(TransactionType.AUTHORIZATION, authorizationId, cardAccount.getCardId(), authorization.getAmount());
+
+        log.info("Authorization created: authorizationId={}, cardId={}, amount={}, kind={}",
+                authorizationId, cardAccount.getCardId(), request.getAmount(), kind);
+
+        return mapToResponse(authorization);
     }
 
     /**
@@ -217,108 +221,88 @@ public class PaymentService {
     }
 
     private PaymentResponse doCapture(String authorizationId, BigDecimal amount) {
-        try {
-            Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
-                    .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
+        Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
+                .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
 
-            BigDecimal releasedAmount = authorization.capture(amount);
-            authorizationRepository.save(authorization);
+        BigDecimal releasedAmount = authorization.capture(amount);
+        authorizationRepository.save(authorization);
 
-            if (releasedAmount.compareTo(BigDecimal.ZERO) > 0) {
-                CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
-                        .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
-                cardAccount.increaseAvailableAmount(releasedAmount);
-                cardAccountRepository.save(cardAccount);
-            }
-            recordTransaction(authorization, TransactionType.CAPTURE, amount);
-            auditLogService.recordSuccess(TransactionType.CAPTURE, authorizationId, authorization.getCardId(), amount);
-
-            log.info("Payment captured: authorizationId={}, amount={}, releasedRemainder={}", authorizationId, amount, releasedAmount);
-
-            return mapToResponse(authorization);
-        } catch (RuntimeException ex) {
-            auditLogService.recordFailure(TransactionType.CAPTURE, authorizationId, null, amount, ex.getMessage());
-            throw ex;
+        if (releasedAmount.compareTo(BigDecimal.ZERO) > 0) {
+            CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
+                    .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
+            cardAccount.increaseAvailableAmount(releasedAmount);
+            cardAccountRepository.save(cardAccount);
         }
+        recordTransaction(authorization, TransactionType.CAPTURE, amount);
+        auditLogService.recordSuccess(TransactionType.CAPTURE, authorizationId, authorization.getCardId(), amount);
+
+        log.info("Payment captured: authorizationId={}, amount={}, releasedRemainder={}", authorizationId, amount, releasedAmount);
+
+        return mapToResponse(authorization);
     }
 
     private PaymentResponse doCancel(String authorizationId) {
-        try {
-            Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
-                    .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
+        Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
+                .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
 
-            authorization.cancel();
-            authorizationRepository.save(authorization);
+        authorization.cancel();
+        authorizationRepository.save(authorization);
 
-            if (authorization.getAmount().compareTo(BigDecimal.ZERO) > 0) {
-                CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
-                        .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
-                cardAccount.increaseAvailableAmount(authorization.getAmount());
-                cardAccountRepository.save(cardAccount);
-            }
-            recordTransaction(authorization, TransactionType.CANCEL, authorization.getAmount());
-            auditLogService.recordSuccess(TransactionType.CANCEL, authorizationId, authorization.getCardId(), authorization.getAmount());
-
-            log.info("Authorization cancelled: authorizationId={}, restoredAmount={}", authorizationId, authorization.getAmount());
-
-            return mapToResponse(authorization);
-        } catch (RuntimeException ex) {
-            auditLogService.recordFailure(TransactionType.CANCEL, authorizationId, null, null, ex.getMessage());
-            throw ex;
+        if (authorization.getAmount().compareTo(BigDecimal.ZERO) > 0) {
+            CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
+                    .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
+            cardAccount.increaseAvailableAmount(authorization.getAmount());
+            cardAccountRepository.save(cardAccount);
         }
+        recordTransaction(authorization, TransactionType.CANCEL, authorization.getAmount());
+        auditLogService.recordSuccess(TransactionType.CANCEL, authorizationId, authorization.getCardId(), authorization.getAmount());
+
+        log.info("Authorization cancelled: authorizationId={}, restoredAmount={}", authorizationId, authorization.getAmount());
+
+        return mapToResponse(authorization);
     }
 
     private PaymentResponse doPartialRefund(String authorizationId, BigDecimal amount) {
-        try {
-            Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
-                    .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
+        Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
+                .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
 
-            authorization.partialRefund(amount);
-            authorizationRepository.save(authorization);
+        authorization.partialRefund(amount);
+        authorizationRepository.save(authorization);
 
+        CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
+                .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
+        cardAccount.increaseAvailableAmount(amount);
+        cardAccountRepository.save(cardAccount);
+        recordTransaction(authorization, TransactionType.PARTIAL_REFUND, amount);
+        auditLogService.recordSuccess(TransactionType.PARTIAL_REFUND, authorizationId, authorization.getCardId(), amount);
+
+        log.info("Partial refund processed: authorizationId={}, amount={}, totalRefunded={}",
+                authorizationId, amount, authorization.getRefundedAmount());
+
+        return mapToResponse(authorization);
+    }
+
+    private PaymentResponse doRefund(String authorizationId, BigDecimal amount) {
+        Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
+                .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
+
+        boolean fullRefund = authorization.getRemainingRefundableAmount().compareTo(amount) == 0;
+        authorization.refund(amount);
+        authorizationRepository.save(authorization);
+
+        if (amount.compareTo(BigDecimal.ZERO) > 0) {
             CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
                     .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
             cardAccount.increaseAvailableAmount(amount);
             cardAccountRepository.save(cardAccount);
-            recordTransaction(authorization, TransactionType.PARTIAL_REFUND, amount);
-            auditLogService.recordSuccess(TransactionType.PARTIAL_REFUND, authorizationId, authorization.getCardId(), amount);
-
-            log.info("Partial refund processed: authorizationId={}, amount={}, totalRefunded={}",
-                    authorizationId, amount, authorization.getRefundedAmount());
-
-            return mapToResponse(authorization);
-        } catch (RuntimeException ex) {
-            auditLogService.recordFailure(TransactionType.PARTIAL_REFUND, authorizationId, null, amount, ex.getMessage());
-            throw ex;
         }
-    }
+        TransactionType refundAction = fullRefund ? TransactionType.REFUND : TransactionType.PARTIAL_REFUND;
+        recordTransaction(authorization, refundAction, amount);
+        auditLogService.recordSuccess(refundAction, authorizationId, authorization.getCardId(), amount);
 
-    private PaymentResponse doRefund(String authorizationId, BigDecimal amount) {
-        try {
-            Authorization authorization = authorizationRepository.findByAuthorizationIdForUpdate(authorizationId)
-                    .orElseThrow(() -> new NotFoundException("Authorization not found: " + authorizationId));
+        log.info("Refund processed: authorizationId={}, amount={}, full={}", authorizationId, amount, fullRefund);
 
-            boolean fullRefund = authorization.getRemainingRefundableAmount().compareTo(amount) == 0;
-            authorization.refund(amount);
-            authorizationRepository.save(authorization);
-
-            if (amount.compareTo(BigDecimal.ZERO) > 0) {
-                CardAccount cardAccount = cardAccountRepository.findByCardIdForUpdate(authorization.getCardId())
-                        .orElseThrow(() -> new NotFoundException("Card account not found: " + authorization.getCardId()));
-                cardAccount.increaseAvailableAmount(amount);
-                cardAccountRepository.save(cardAccount);
-            }
-            TransactionType refundAction = fullRefund ? TransactionType.REFUND : TransactionType.PARTIAL_REFUND;
-            recordTransaction(authorization, refundAction, amount);
-            auditLogService.recordSuccess(refundAction, authorizationId, authorization.getCardId(), amount);
-
-            log.info("Refund processed: authorizationId={}, amount={}, full={}", authorizationId, amount, fullRefund);
-
-            return mapToResponse(authorization);
-        } catch (RuntimeException ex) {
-            auditLogService.recordFailure(TransactionType.REFUND, authorizationId, null, amount, ex.getMessage());
-            throw ex;
-        }
+        return mapToResponse(authorization);
     }
 
     private PaymentResponse mapToResponse(Authorization authorization) {
@@ -343,28 +327,37 @@ public class PaymentService {
      *
      * 1. Fast path: a COMPLETED key replays its cached response.
      * 2. Otherwise make sure a row exists: reserve an IN_PROGRESS placeholder
-     *    in its own committed REQUIRES_NEW transaction. Losing that insert
-     *    race to a concurrent duplicate is fine — the row exists either way.
-     * 3. Lock the row (SELECT ... FOR UPDATE) in the outer transaction. If
-     *    another request owns it, this blocks until that request commits or
-     *    rolls back.
+     *    in its own committed transaction. Losing that insert race to a
+     *    concurrent duplicate is fine — the row exists either way.
+     * 3. Open the business transaction and lock the row (SELECT ... FOR
+     *    UPDATE). If another request owns it, this blocks until that request
+     *    commits or rolls back.
      * 4. With the lock held: COMPLETED means a concurrent duplicate finished
      *    first — replay it. IN_PROGRESS means nobody completed it: either we
      *    just reserved it, or the previous owner's transaction rolled back
      *    (business failure, failed commit, crashed process) and took all its
      *    business writes with it. Either way it's safe to run the operation.
-     * 5. Run the operation and mark the key COMPLETED in the same outer
+     * 5. Run the operation and mark the key COMPLETED in the same
      *    transaction, so the payment and its cached response commit or roll
      *    back together.
      *
-     * Nothing ever deletes the placeholder on failure. A REQUIRES_NEW delete
-     * would wait on the very row lock its own outer transaction holds; and
-     * cleanup that has to run never runs when the failure is the commit
+     * Nothing ever deletes the placeholder on failure. A separate-transaction
+     * delete would wait on the very row lock the business transaction holds;
+     * and cleanup that has to run never runs when the failure is the commit
      * itself, or a dead process — which is how keys used to get stuck.
+     *
+     * Deliberately NOT @Transactional: every step above, and the failure
+     * audit entry, runs in its own transaction one after another, so a
+     * request never holds a pooled connection while waiting for a second
+     * one. Nesting them (an outer transaction around REQUIRES_NEW calls)
+     * lets pool-size concurrent requests each hold one connection and wait
+     * forever for another. For the same reason, callers must not invoke the
+     * payment operations from inside an existing transaction.
      */
     private PaymentResponse handleIdempotentRequest(String idempotencyKey,
                                                      String requestUri,
                                                      String requestBodyHash,
+                                                     FailedAttempt failedAttempt,
                                                      Supplier<PaymentResponse> operation) {
         validateIdempotencyKey(idempotencyKey);
         String actor = CurrentActor.resolve();
@@ -381,20 +374,34 @@ public class PaymentService {
             }
         }
 
-        IdempotencyKey key = idempotencyKeyRepository.findByActorAndKeyValueForUpdate(actor, idempotencyKey)
-                .orElseThrow(() -> new IllegalStateException("Idempotency placeholder was unexpectedly removed"));
-        if (key.isCompleted()) {
-            return replay(key, requestUri, requestBodyHash);
-        }
-        if (!key.matches(requestUri, requestBodyHash)) {
-            log.info("Taking over abandoned idempotency key for a different request: key={}", idempotencyKey);
-        }
-        key.takeOver(requestUri, requestBodyHash);
+        boolean[] operationStarted = {false};
+        try {
+            return transactionTemplate.execute(status -> {
+                IdempotencyKey key = idempotencyKeyRepository.findByActorAndKeyValueForUpdate(actor, idempotencyKey)
+                        .orElseThrow(() -> new IllegalStateException("Idempotency placeholder was unexpectedly removed"));
+                if (key.isCompleted()) {
+                    return replay(key, requestUri, requestBodyHash);
+                }
+                if (!key.matches(requestUri, requestBodyHash)) {
+                    log.info("Taking over abandoned idempotency key for a different request: key={}", idempotencyKey);
+                }
+                key.takeOver(requestUri, requestBodyHash);
 
-        PaymentResponse response = operation.get();
-        key.complete(serializeResponse(response));
-        idempotencyKeyRepository.save(key);
-        return response;
+                operationStarted[0] = true;
+                PaymentResponse response = operation.get();
+                key.complete(serializeResponse(response));
+                idempotencyKeyRepository.save(key);
+                return response;
+            });
+        } catch (RuntimeException ex) {
+            // Recorded after the business transaction has rolled back, in a
+            // transaction of its own — the failed attempt must stay on record.
+            if (operationStarted[0]) {
+                auditLogService.recordFailure(failedAttempt.action(), failedAttempt.authorizationId(),
+                        failedAttempt.cardId(), failedAttempt.amount(), ex.getMessage());
+            }
+            throw ex;
+        }
     }
 
     private void validateIdempotencyKey(String idempotencyKey) {

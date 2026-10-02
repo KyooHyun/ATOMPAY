@@ -22,6 +22,7 @@ import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -62,6 +63,7 @@ class PaymentServiceMySqlConcurrencyTest {
         registry.add("spring.datasource.driver-class-name", mysql::getDriverClassName);
         registry.add("spring.jpa.hibernate.ddl-auto", () -> "update");
         registry.add("spring.jpa.database-platform", () -> "org.hibernate.dialect.MySQLDialect");
+        registry.add("spring.datasource.hikari.connection-init-sql", () -> "SET SESSION innodb_lock_wait_timeout=2");
     }
 
     @Autowired
@@ -81,6 +83,9 @@ class PaymentServiceMySqlConcurrencyTest {
 
     @Autowired
     private PlatformTransactionManager transactionManager;
+
+    @Autowired
+    private IdempotencyService idempotencyService;
 
     @BeforeEach
     void setUp() {
@@ -194,62 +199,113 @@ class PaymentServiceMySqlConcurrencyTest {
     /**
      * capture and cancel both start from AUTHORIZED and are mutually
      * exclusive. Racing them must produce exactly one winner, and the card's
-     * available amount must match whichever one won: cancel restores the full
-     * hold, capture keeps it deducted. Without the Authorization row lock
-     * both could read AUTHORIZED, and the card would end up with a captured
-     * payment whose hold had also been released.
+     * available amount must match whichever one won: cancel releases the
+     * whole hold, a partial capture releases only the uncaptured remainder.
+     *
+     * It is also the deadlock canary. Both paths lock Authorization and then
+     * CardAccount; if either took them in the opposite order, this exact
+     * race would deadlock. So the loser must lose on the domain rule ("only
+     * AUTHORIZED can ..."), never as a deadlock victim or lock timeout — and
+     * repeated rounds give the bad interleaving room to happen.
      */
     @Test
-    void mySqlConcurrentCaptureAndCancelShouldHaveExactlyOneWinner() throws InterruptedException {
+    void mySqlConcurrentCaptureAndCancelShouldHaveExactlyOneWinnerAndNoDeadlock() throws InterruptedException {
+        for (int round = 0; round < 15; round++) {
+            BigDecimal before = availableAmount();
+            AuthorizeRequest request = new AuthorizeRequest();
+            request.setCardId("CARD-001");
+            request.setAmount(BigDecimal.valueOf(250_000));
+            String authorizationId = paymentService.authorize(request, "race-auth-" + round).getAuthorizationId();
+
+            CountDownLatch startLatch = new CountDownLatch(1);
+            CountDownLatch endLatch = new CountDownLatch(2);
+            ExecutorService executor = Executors.newFixedThreadPool(2);
+            CopyOnWriteArrayList<String> winners = new CopyOnWriteArrayList<>();
+            CopyOnWriteArrayList<Exception> losses = new CopyOnWriteArrayList<>();
+            int r = round;
+
+            executor.submit(() -> {
+                try {
+                    startLatch.await();
+                    paymentService.capture(authorizationId, BigDecimal.valueOf(100_000), "race-capture-" + r);
+                    winners.add("capture");
+                } catch (Exception ex) {
+                    losses.add(ex);
+                } finally {
+                    endLatch.countDown();
+                }
+            });
+            executor.submit(() -> {
+                try {
+                    startLatch.await();
+                    paymentService.cancel(authorizationId, "race-cancel-" + r);
+                    winners.add("cancel");
+                } catch (Exception ex) {
+                    losses.add(ex);
+                } finally {
+                    endLatch.countDown();
+                }
+            });
+
+            startLatch.countDown();
+            endLatch.await(15, TimeUnit.SECONDS);
+            executor.shutdownNow();
+
+            assertThat(winners).as("round %d", round).hasSize(1);
+            assertThat(losses).as("round %d", round).singleElement()
+                    .isInstanceOf(IllegalStateException.class);
+
+            boolean captureWon = winners.get(0).equals("capture");
+            assertThat(authorizationRepository.findByAuthorizationId(authorizationId).orElseThrow().getStatus().name())
+                    .isEqualTo(captureWon ? "CAPTURED" : "CANCELLED");
+            // capture keeps 100,000 of the 250,000 hold; cancel releases all of it
+            assertThat(availableAmount()).isEqualByComparingTo(
+                    captureWon ? before.subtract(BigDecimal.valueOf(100_000)) : before);
+            assertThat(paymentTransactionRepository.findByAuthorizationIdOrderByCreatedAtAsc(authorizationId))
+                    .extracting(transaction -> transaction.getTransactionType())
+                    .containsExactly(TransactionType.AUTHORIZATION, captureWon ? TransactionType.CAPTURE : TransactionType.CANCEL);
+        }
+    }
+
+    /**
+     * A request that can't get the idempotency key's row lock within
+     * innodb_lock_wait_timeout must fail as a retryable lock failure (mapped
+     * to 409), not leak out as a 500 the way UnexpectedRollbackException
+     * used to — and it must not have run the payment.
+     */
+    @Test
+    void lockWaitTimeoutOnIdempotencyKeyShouldSurfaceAsRetryableLockFailure() throws Exception {
         AuthorizeRequest request = new AuthorizeRequest();
         request.setCardId("CARD-001");
-        request.setAmount(BigDecimal.valueOf(250_000));
-        PaymentResponse authorization = paymentService.authorize(request, "key-race-auth");
-        String authorizationId = authorization.getAuthorizationId();
+        request.setAmount(BigDecimal.valueOf(10_000));
 
-        CountDownLatch startLatch = new CountDownLatch(1);
-        CountDownLatch endLatch = new CountDownLatch(2);
-        ExecutorService executor = Executors.newFixedThreadPool(2);
-        CopyOnWriteArrayList<String> winners = new CopyOnWriteArrayList<>();
-
-        executor.submit(() -> {
+        idempotencyService.reservePlaceholder("system", "held-key", "/api/v1/payments/authorize", "hash");
+        CountDownLatch locked = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        ExecutorService holder = Executors.newSingleThreadExecutor();
+        holder.submit(() -> new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+            idempotencyKeyRepository.findByActorAndKeyValueForUpdate("system", "held-key").orElseThrow();
+            locked.countDown();
             try {
-                startLatch.await();
-                paymentService.capture(authorizationId, BigDecimal.valueOf(250_000), "key-race-capture");
-                winners.add("capture");
-            } catch (Exception ignored) {
-            } finally {
-                endLatch.countDown();
+                release.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
-        });
-        executor.submit(() -> {
-            try {
-                startLatch.await();
-                paymentService.cancel(authorizationId, "key-race-cancel");
-                winners.add("cancel");
-            } catch (Exception ignored) {
-            } finally {
-                endLatch.countDown();
-            }
-        });
+        }));
+        assertThat(locked.await(5, TimeUnit.SECONDS)).isTrue();
 
-        startLatch.countDown();
-        endLatch.await(15, TimeUnit.SECONDS);
-        executor.shutdownNow();
-
-        assertThat(winners).hasSize(1);
-        String finalStatus = authorizationRepository.findByAuthorizationId(authorizationId).orElseThrow().getStatus().name();
-        if (winners.get(0).equals("capture")) {
-            assertThat(finalStatus).isEqualTo("CAPTURED");
-            assertThat(availableAmount()).isEqualByComparingTo(BigDecimal.valueOf(4_750_000));
-        } else {
-            assertThat(finalStatus).isEqualTo("CANCELLED");
-            assertThat(availableAmount()).isEqualByComparingTo(BigDecimal.valueOf(5_000_000));
+        try {
+            assertThatThrownBy(() -> paymentService.authorize(request, "held-key"))
+                    .isInstanceOf(PessimisticLockingFailureException.class);
+            assertThat(authorizationRepository.count()).isZero();
+        } finally {
+            release.countDown();
+            holder.shutdown();
+            holder.awaitTermination(10, TimeUnit.SECONDS);
         }
-        assertThat(paymentTransactionRepository.findByAuthorizationIdOrderByCreatedAtAsc(authorizationId))
-                .extracting(transaction -> transaction.getTransactionType())
-                .containsExactly(TransactionType.AUTHORIZATION,
-                        winners.get(0).equals("capture") ? TransactionType.CAPTURE : TransactionType.CANCEL);
+
+        // Once the holder is gone, the same key goes through.
+        assertThat(paymentService.authorize(request, "held-key").getStatus()).isEqualTo("AUTHORIZED");
     }
 
     private BigDecimal availableAmount() {

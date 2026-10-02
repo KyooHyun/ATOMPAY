@@ -4,6 +4,7 @@ import com.atompay.cardpaycore.dto.ErrorResponse;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -22,6 +23,20 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(IdempotencyKeyReuseException.class)
     public ResponseEntity<ErrorResponse> handleIdempotencyKeyReuse(IdempotencyKeyReuseException ex, HttpServletRequest request) {
         return buildErrorResponse(HttpStatus.UNPROCESSABLE_ENTITY, ex.getMessage(), request.getRequestURI());
+    }
+
+    /**
+     * Lock wait timeout or deadlock victim: the request did nothing (its
+     * transaction rolled back) and the same request can simply be retried.
+     * That's a 409 with Retry-After, not a 500 — retrying with the same
+     * Idempotency-Key is always safe.
+     */
+    @ExceptionHandler(PessimisticLockingFailureException.class)
+    public ResponseEntity<ErrorResponse> handleLockContention(PessimisticLockingFailureException ex, HttpServletRequest request) {
+        log.warn("Lock contention on {} {}: {}", request.getMethod(), request.getRequestURI(), ex.getMessage());
+        ResponseEntity<ErrorResponse> response = buildErrorResponse(HttpStatus.CONFLICT,
+                "The resource is busy with a concurrent request. Retry with the same Idempotency-Key.", request.getRequestURI());
+        return ResponseEntity.status(response.getStatusCode()).header("Retry-After", "1").body(response.getBody());
     }
 
     @ExceptionHandler(BadRequestException.class)

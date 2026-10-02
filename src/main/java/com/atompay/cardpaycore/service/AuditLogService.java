@@ -30,8 +30,10 @@ public class AuditLogService {
     }
 
     /**
-     * REQUIRES_NEW: the caller's transaction is about to roll back, so this
-     * entry must commit independently or it would roll back with it.
+     * PaymentService calls this after the failed business transaction has
+     * already rolled back, so it normally starts a fresh transaction.
+     * REQUIRES_NEW keeps that true even when some caller up the stack has a
+     * transaction open — a failed attempt must stay on record either way.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void recordFailure(TransactionType action, String authorizationId, String cardId,
